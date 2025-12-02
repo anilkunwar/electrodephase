@@ -173,7 +173,7 @@ if run_sim:
     for step, frame in zip(saved_steps, saved_frames):
         bio = BytesIO()
         np.save(bio, frame)
-        cur.execute("INSERT INTO frames VALUES (?, ?, ?)", (step, frame.mean(), sqlite3.Binary(zlib.compress(bio.getvalue())))
+        cur.execute("INSERT INTO frames VALUES (?, ?, ?)", (step, frame.mean(), sqlite3.Binary(zlib.compress(bio.getvalue()))))
 
     conn.commit()
     sql_dump = BytesIO()
