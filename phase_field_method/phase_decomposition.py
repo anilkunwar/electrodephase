@@ -53,7 +53,7 @@ run_sim = st.button("🚀 Run Simulation", type="primary")
 os.environ["NUMBA_NUM_THREADS"] = str(numba_threads)
 
 # ------------------- Helpers / caching -------------------
-@st.experimental_memo
+@st.cache_data
 def make_initial_condition(nx, ny, seed_radius_frac=0.03, seed_center=None, initial_perturb=0.0, seed_value=0.98, background=0.02):
     c = background * np.ones((nx, ny), dtype=np.float64)
     seed_radius = int(seed_radius_frac * nx)
