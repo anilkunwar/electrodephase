@@ -95,7 +95,7 @@ if run_sim:
     status_text = st.empty()
 
     for step in range(0, total_steps + 1, save_every):
-        saved_frames.append(c.copy()
+        saved_frames.append(c.copy())
         saved_steps.append(step)
 
         for _ in range(save_every):
