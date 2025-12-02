@@ -15,7 +15,7 @@ import time
 
 # =====================================================
 # Streamlit App: Patched LiFePO4 Phase-Field Simulator
-# - Numba-friendly blocked + parallel update kernel
+# - FIXED: Sequential update kernel to avoid UnsupportedRewriteError
 # - Conservative dt stability check and clamping
 # - Plotly animation memory improvements (float32, frames)
 # - Session state enforcement for caching results
@@ -26,7 +26,7 @@ st.title("🔋 LiFePO4 Phase-Field Simulator — Patched")
 
 st.markdown(
     """
-**Patched version:** Numba-compatible blocked update kernel (no np.roll),
+**Patched version:** Numba-compatible sequential update kernel (no parallel rewriting issues),
 stability check for dt, smaller animation payloads and optional tuning knobs.
 """
 )
@@ -59,9 +59,9 @@ if charging:
 else:
     charging_rate = 0.0
 
-# Tuning knobs
-block_size = st.sidebar.selectbox("Block size (cache tuning)", [16, 32, 64, 128], index=2)
-numba_threads = st.sidebar.number_input("NUMBA_NUM_THREADS (env)", 1, os.cpu_count() or 1, os.cpu_count() or 1, step=1)
+# Tuning knobs (removed parallel-related options)
+block_size = st.sidebar.selectbox("Block size (cache tuning - now sequential)", [16, 32, 64, 128], index=2)
+# Note: numba_threads removed since we're using sequential update
 
 # Clear cache button
 if st.sidebar.button("🗑️ Clear Simulation Cache"):
@@ -73,9 +73,6 @@ if st.sidebar.button("🗑️ Clear Simulation Cache"):
     st.rerun()
 
 run_sim = st.button("🚀 Run Simulation", type="primary")
-
-# Set number of threads for numba
-os.environ["NUMBA_NUM_THREADS"] = str(numba_threads)
 
 # ------------------- Helpers / caching -------------------
 @st.cache_data
@@ -97,7 +94,7 @@ def make_initial_condition(nx, ny, seed_radius_frac=0.03, seed_center=None, init
     return c
 
 # ------------------- Numba kernels & stability -------------------
-_STABILITY_C = 0.1  # More conservative stability factor
+_STABILITY_C = 0.05  # More conservative stability factor (increased from 0.1)
 
 @njit(cache=True)
 def compute_dt_max(dx, M_effective, kappa_local):
@@ -105,90 +102,46 @@ def compute_dt_max(dx, M_effective, kappa_local):
     # Conservative dt max for explicit-like stepping
     return _STABILITY_C * (dx ** 4) / (M_effective * kappa_local + 1e-30)
 
-@njit(parallel=True, cache=True)
+@njit(cache=True)  # REMOVED: parallel=True - using sequential double-buffered update
 def update_blocked(c, dt, A_local, kappa_local, M_slow_local, M_fast_local, charging_rate_local, block_size_local):
-    """Update kernel with blocked access pattern."""
+    """Double-buffered sequential stencil - Numba-safe, fast."""
     nx, ny = c.shape
     c_new = np.empty_like(c)
-    
-    # Pre-compute constants
-    dx = 1.0  # Assuming unit grid spacing
+    dx = 1.0
     inv_dx2 = 1.0 / (dx * dx)
     
-    # Loop over blocks in i-direction in parallel
-    for bi in prange(0, nx, block_size_local):
-        i_max = bi + block_size_local if bi + block_size_local <= nx else nx
-        for bj in range(0, ny, block_size_local):
-            j_max = bj + block_size_local if bj + block_size_local <= ny else ny
+    # Sequential double-buffer update (Numba stencil-friendly)
+    for i in range(nx):
+        im = i - 1 if i > 0 else nx - 1
+        ip = i + 1 if i < nx - 1 else 0
+        for j in range(ny):
+            jm = j - 1 if j > 0 else ny - 1
+            jp = j + 1 if j < ny - 1 else 0
             
-            # Inner block loops
-            for i in range(bi, i_max):
-                im = (i - 1) % nx
-                ip = (i + 1) % nx
-                for j in range(bj, j_max):
-                    jm = (j - 1) % ny
-                    jp = (j + 1) % ny
-                    
-                    # Chemical potential at center
-                    ci = c[i, j]
-                    chem = 4.0 * A_local * ci * (ci - 1.0) * (ci - 0.5)
-                    
-                    # Laplacian (5-point)
-                    lap = (c[im, j] + c[ip, j] + c[i, jm] + c[i, jp] - 4.0 * ci) * inv_dx2
-                    
-                    mu = chem - kappa_local * lap
-                    
-                    # Compute neighbor mu values
-                    cip = c[ip, j]
-                    cim = c[im, j]
-                    cjp = c[i, jp]
-                    cjm = c[i, jm]
-                    
-                    # Chemical potentials at neighbors
-                    chem_ip = 4.0 * A_local * cip * (cip - 1.0) * (cip - 0.5)
-                    chem_im = 4.0 * A_local * cim * (cim - 1.0) * (cim - 0.5)
-                    chem_jp = 4.0 * A_local * cjp * (cjp - 1.0) * (cjp - 0.5)
-                    chem_jm = 4.0 * A_local * cjm * (cjm - 1.0) * (cjm - 0.5)
-                    
-                    # Laplacians at neighbors
-                    lap_ip = (c[(ip - 1) % nx, j] + c[(ip + 1) % nx, j] + c[ip, (j - 1) % ny] + c[ip, (j + 1) % ny] - 4.0 * cip) * inv_dx2
-                    lap_im = (c[(im - 1) % nx, j] + c[(im + 1) % nx, j] + c[im, (j - 1) % ny] + c[im, (j + 1) % ny] - 4.0 * cim) * inv_dx2
-                    lap_jp = (c[(i - 1) % nx, jp] + c[(i + 1) % nx, jp] + c[i, (jp - 1) % ny] + c[i, (jp + 1) % ny] - 4.0 * cjp) * inv_dx2
-                    lap_jm = (c[(i - 1) % nx, jm] + c[(i + 1) % nx, jm] + c[i, (jm - 1) % ny] + c[i, (jm + 1) % ny] - 4.0 * cjm) * inv_dx2
-                    
-                    mu_ip = chem_ip - kappa_local * lap_ip
-                    mu_im = chem_im - kappa_local * lap_im
-                    mu_jp = chem_jp - kappa_local * lap_jp
-                    mu_jm = chem_jm - kappa_local * lap_jm
-                    
-                    # Gradients of chemical potential
-                    grad_mu_x = (mu_ip - mu_im) / (2.0 * dx)
-                    grad_mu_y = (mu_jp - mu_jm) / (2.0 * dx)
-                    
-                    # Anisotropic fluxes
-                    Jx = -M_fast_local * grad_mu_x
-                    Jy = -M_slow_local * grad_mu_y
-                    
-                    # Divergence of flux
-                    div_Jx = (Jx - (-M_fast_local * (mu - mu_im) / dx)) / dx
-                    div_Jy = (Jy - (-M_slow_local * (mu - mu_jm) / dx)) / dx
-                    
-                    div = div_Jx + div_Jy
-                    
-                    # Update concentration
-                    c_new[i, j] = ci + dt * div
+            # Center values
+            ci = c[i, j]
+            chem = 4.0 * A_local * ci * (ci - 1.0) * (ci - 0.5)
+            lap = (c[im, j] + c[ip, j] + c[i, jm] + c[i, jp] - 4.0 * ci) * inv_dx2
+            mu = chem - kappa_local * lap
+            
+            # Simplified anisotropic divergence (M_fast_x, M_slow_y)
+            # Backward differences for stability
+            grad_mu_x = (mu - (chem - kappa_local * (c[im, j] + c[(im-1)%nx, j] + c[im, jm] + c[im, jp] - 4.0*c[im,j])*inv_dx2)) / dx
+            grad_mu_y = (mu - (chem - kappa_local * (c[i, jm] + c[im, jm] + c[ip, jm] + c[i, (jm-1)%ny] - 4.0*c[i,jm])*inv_dx2)) / dx
+            
+            Jx = -M_fast_local * grad_mu_x
+            Jy = -M_slow_local * grad_mu_y
+            div = (Jx - (-M_fast_local * (mu - (chem - kappa_local * (c[im, j] + c[(im-1)%nx, j] + c[im, jm] + c[im, jp] - 4.0*c[im,j])*inv_dx2)) / dx)) / dx + \
+                  (Jy - (-M_slow_local * (mu - (chem - kappa_local * (c[i, jm] + c[im, jm] + c[ip, jm] + c[i, (jm-1)%ny] - 4.0*c[i,jm])*inv_dx2)) / dx)) / dx
+            
+            c_new[i, j] = ci + dt * div
     
-    # Apply charging boundary condition if needed
+    # Charging boundary (sequential safe)
     if charging_rate_local > 0.0:
-        charging_rows = min(5, c_new.shape[0])
-        for ii in range(charging_rows):
-            for jj in range(c_new.shape[1]):
+        for ii in range(min(5, nx)):
+            for jj in range(ny):
                 v = c_new[ii, jj] + charging_rate_local
-                if v > 1.0:
-                    v = 1.0
-                elif v < 0.0:
-                    v = 0.0
-                c_new[ii, jj] = v
+                c_new[ii, jj] = max(0.0, min(1.0, v))
     
     return c_new
 
@@ -236,7 +189,6 @@ if run_sim:
         'charging': charging,
         'charging_rate': charging_rate,
         'block_size': block_size,
-        'numba_threads': numba_threads
     }
     
     current_hash = create_parameters_hash(current_params)
@@ -286,11 +238,8 @@ if run_sim:
         step = 0
         start_time = time.time()
         
-        # Initialize Numba functions with a small warm-up run
-        if step == 0:
-            # Warm up the Numba function with a small test
-            test_c = np.ones((32, 32), dtype=np.float64)
-            _ = update_blocked(test_c, dt, A, kappa, M_slow, M_fast, charging_rate, int(block_size))
+        # REMOVED: The warmup test block that was causing UnsupportedRewriteError
+        # The first real call will compile the function safely
         
         while step < int(total_steps):
             # Update
