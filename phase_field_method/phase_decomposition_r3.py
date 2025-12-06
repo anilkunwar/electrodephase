@@ -12,26 +12,10 @@ import time
 
 # =====================================================
 # LiFePO4 Phase-Field Simulator — FINAL: Regular Solution + Elasticity + Correct Butler-Volmer
-# • Strong phase separation even at low Li content
-# • Butler-Volmer kinetics properly implemented (symmetric α=0.5, sinh form)
-# • Low k_r → reaction-limited homogeneous filling
-# • High k_r → diffusion-limited sharp stripes/domino waves
-# • All bugs eliminated – runs perfectly
 # =====================================================
 
 st.set_page_config(page_title="LiFePO4 Phase-Field Simulator (Final Correct Version)", layout="centered")
 st.title("🔋 LiFePO4 Phase-Field Simulator — Final Correct Version")
-st.markdown(
-    """
-**Truly physical & bug-free – December 2025**  
-✓ Regular solution free energy → violent phase separation  
-✓ Mean-field coherency elasticity → perfect stripe stabilization  
-✓ Correct Butler-Volmer boundary condition (sinh form, symmetric α=0.5)  
-✓ Toggle between potentiostatic (BV) and approximate galvanostatic (constant flux)  
-✓ Low k_r in BV mode = surface-reaction-limited → suppresses stripes  
-✓ High k_r = diffusion-limited → classic sharp stripes
-"""
-)
 
 # ------------------- Session state -------------------
 for key in ['cached_frames', 'cached_steps', 'parameters_hash']:
@@ -55,18 +39,21 @@ if use_elasticity:
     elastic_omega = st.sidebar.slider("Elastic strength Ω_el / RT", 0.0, 100.0, 40.0, step=5.0)
 
 bc_mode = st.sidebar.radio("Boundary condition", ["Butler-Volmer (potentiostatic)", "Constant flux (galvanostatic approx)"])
+flux_rows = st.sidebar.slider("Number of boundary rows for flux", 1, 50, 15, step=1,
+                             help="Number of rows at bottom where flux is applied")
 
 if bc_mode == "Butler-Volmer (potentiostatic)":
     eta_RT = st.sidebar.slider("Overpotential η / RT  (positive = charging)", -15.0, 15.0, 3.0, step=0.5)
     k_r = st.sidebar.slider("Reaction rate constant k_r", 1.0, 500.0, 80.0, step=10.0,
                             help="Low = reaction-limited, High = diffusion-limited")
+    flux_rate_param = k_r * np.sinh(eta_RT * 0.5)
 else:
     constant_flux = st.sidebar.slider("Constant flux rate", 0.0001, 0.02, 0.0025, format="%.6f")
+    flux_rate_param = constant_flux
 
 if st.sidebar.button("Clear Cache"):
-    st.session_state.cached_frames = None
-    st.session_state.cached_steps = None
-    st.session_state.parameters_hash = None
+    for key in ['cached_frames', 'cached_steps', 'parameters_hash']:
+        st.session_state[key] = None
     st.rerun()
 
 run_sim = st.button("Run Simulation", type="primary")
@@ -81,7 +68,7 @@ def make_ic(nx, ny):
     c[mask] = 0.98
     return c
 
-# ------------------- Numba kernel (fixed BV logic) -------------------
+# ------------------- Numba kernel -------------------
 _STABILITY_C = 0.22
 
 @njit(cache=True)
@@ -89,7 +76,7 @@ def safe_log(x):
     return np.log(np.clip(x, 1e-12, 1.0 - 1e-12))
 
 @njit(cache=True)
-def update(c, dt, Omega_RT, kappa, M_x, M_y, flux_rate, elastic_omega):
+def update(c, dt, Omega_RT, kappa, M_x, M_y, flux_rate, elastic_omega, flux_rows):
     nx, ny = c.shape
     mu = np.empty_like(c)
     c_new = np.empty_like(c)
@@ -122,13 +109,12 @@ def update(c, dt, Omega_RT, kappa, M_x, M_y, flux_rate, elastic_omega):
 
             c_new[i,j] = c[i,j] + dt * (lap_mu_x + lap_mu_y)
 
-    # Uniform flux into bottom facet
-    n_rows = max(15, nx//25)
-    for i in range(n_rows):
+    # Apply flux to bottom boundary rows
+    for i in range(min(flux_rows, nx)):
         for j in range(ny):
             c_new[i,j] += flux_rate * dt
+    
     c_new = np.clip(c_new, 0.0, 1.0)
-
     return c_new
 
 @njit(cache=True)
@@ -138,21 +124,31 @@ def get_dt(M_eff, kappa):
 # ------------------- Main -------------------
 if run_sim:
     # Mobilities
-    M_x = M_fast_ratio * M_slow if fast_dir == "Horizontal (x)" else M_slow
-    M_y = M_slow if fast_dir == "Horizontal (x)" else M_fast_ratio * M_slow
-
-    # Flux rate for this mode
-    if bc_mode == "Butler-Volmer (potentiostatic)":
-        flux_rate = k_r * np.sinh(eta_RT * 0.5)   # symmetric α=0.5, correct BV form in reduced units
+    if fast_dir == "Horizontal (x)":
+        M_x = M_fast_ratio * M_slow
+        M_y = M_slow
     else:
-        flux_rate = constant_flux
+        M_x = M_slow
+        M_y = M_fast_ratio * M_slow
 
+    # Create parameters hash for caching
     current_params = {
-        'grid_size': grid_size, 'total_steps': total_steps, 'Omega_RT': Omega_RT, 'kappa': kappa,
-        'M_slow': M_slow, 'M_fast_ratio': M_fast_ratio, 'fast_dir': fast_dir,
-        'save_every': save_every, 'bc_mode': bc_mode, 'flux_rate': flux_rate,
-        'elastic_omega': elastic_omega
+        'grid_size': grid_size, 'total_steps': total_steps, 'Omega_RT': Omega_RT,
+        'kappa': kappa, 'M_slow': M_slow, 'M_fast_ratio': M_fast_ratio,
+        'fast_dir': fast_dir, 'save_every': save_every, 'bc_mode': bc_mode,
+        'use_elasticity': use_elasticity, 'elastic_omega': elastic_omega,
+        'flux_rows': flux_rows
     }
+    
+    # Add BC-specific parameters
+    if bc_mode == "Butler-Volmer (potentiostatic)":
+        current_params['eta_RT'] = eta_RT
+        current_params['k_r'] = k_r
+        flux_rate = flux_rate_param
+    else:
+        current_params['constant_flux'] = constant_flux
+        flux_rate = flux_rate_param
+    
     current_hash = hashlib.md5(str(sorted(current_params.items())).encode()).hexdigest()
 
     if st.session_state.parameters_hash == current_hash and st.session_state.cached_frames is not None:
@@ -161,24 +157,32 @@ if run_sim:
         steps = st.session_state.cached_steps
     else:
         c = make_ic(grid_size, grid_size)
-
         M_eff = max(M_x, M_y)
         dt = get_dt(M_eff, kappa)
-        st.info(f"dt = {dt:.2e} │ Ω/RT = {Omega_RT:.1f} │ flux = {flux_rate:.5f}")
+        
+        st.info(f"""
+        Simulation parameters:
+        - dt = {dt:.2e}
+        - Ω/RT = {Omega_RT:.1f}
+        - Flux rate = {flux_rate:.5f}
+        - Elastic strength = {elastic_omega:.1f}
+        - Fast/slow mobility ratio = {M_fast_ratio}
+        """)
 
         frames = []
         steps = []
-
         progress = st.progress(0.0)
         status = st.empty()
 
         for step in range(1, total_steps + 1):
-            c = update(c, dt, Omega_RT, kappa, M_x, M_y, flux_rate, elastic_omega)
+            c = update(c, dt, Omega_RT, kappa, M_x, M_y, flux_rate, elastic_omega, flux_rows)
+            
             if step % save_every == 0 or step == total_steps:
                 frames.append(c.astype(np.float32))
                 steps.append(step)
                 progress.progress(step / total_steps)
-                status.text(f"Step {step} │ mean c = {c.mean():.4f} │ t ≈ {step*dt:.3f}")
+                if step % (save_every * 5) == 0:
+                    status.text(f"Step {step:,} │ mean c = {c.mean():.4f} │ t ≈ {step*dt:.3f}")
 
         st.session_state.cached_frames = frames
         st.session_state.cached_steps = steps
@@ -188,15 +192,50 @@ if run_sim:
     # Visualization
     if frames:
         fig = go.Figure(
-            frames=[go.Frame(data=go.Heatmap(z=frame, zmin=0, zmax=1, colorscale='RdBu_r'), name=str(s)) for frame, s in zip(frames, steps)]
+            frames=[go.Frame(
+                data=go.Heatmap(
+                    z=frame, 
+                    zmin=0, 
+                    zmax=1, 
+                    colorscale='RdBu_r',
+                    showscale=True
+                ), 
+                name=f"Step {s}"
+            ) for frame, s in zip(frames, steps)]
         )
-        fig.add_trace(go.Heatmap(z=frames[0], zmin=0, zmax=1, colorscale='RdBu_r'))
-        fig.update_layout(title="LiₓFePO₄ – Correct Physics", height=750,
-                      updatemenus=[dict(buttons=[dict(label="Play", method="animate", args=[None, {"frame": {"duration": 80}}])])])
+        
+        fig.add_trace(go.Heatmap(
+            z=frames[0], 
+            zmin=0, 
+            zmax=1, 
+            colorscale='RdBu_r',
+            colorbar=dict(title="Li concentration")
+        ))
+        
+        fig.update_layout(
+            title=f"LiₓFePO₄ – {bc_mode}",
+            height=750,
+            xaxis_title="y position",
+            yaxis_title="x position",
+            updatemenus=[dict(
+                type="buttons",
+                buttons=[
+                    dict(label="Play", method="animate", args=[None, {"frame": {"duration": 80, "redraw": True}}]),
+                    dict(label="Pause", method="animate", args=[[None], {"frame": {"duration": 0}, "mode": "immediate"}])
+                ]
+            )]
+        )
+        
         st.plotly_chart(fig, use_container_width=True)
-
+        
+        # Show final statistics
+        final_frame = frames[-1]
+        st.metric("Final mean concentration", f"{final_frame.mean():.4f}")
+        st.metric("Min concentration", f"{final_frame.min():.4f}")
+        st.metric("Max concentration", f"{final_frame.max():.4f}")
+        
 else:
     if st.session_state.cached_frames is not None:
-        st.info("Cached result ready – click Run to play animation")
+        st.info("Cached result available – click 'Run Simulation' to view animation")
 
-st.caption("Butler-Volmer now works perfectly: low k_r → homogeneous filling, high k_r → sharp stripes. Regular solution free energy guarantees strong phase separation. This is the real LFP behavior. Done! 🚀")
+st.caption("Butler-Volmer kinetics with regular solution free energy. Low k_r → homogeneous filling, high k_r → sharp stripes.")
