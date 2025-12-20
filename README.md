@@ -14,4 +14,4 @@
 
 
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition7-streamlit-red)](https://electrode-phasedecomposition7.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based B)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition7-streamlit-red)](https://electrode-phasedecomposition7.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based simulation, advanced form of S4)
