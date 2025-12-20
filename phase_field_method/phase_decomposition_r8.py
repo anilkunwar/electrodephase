@@ -4,7 +4,9 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from io import BytesIO
 import pandas as pd
-
+########################################################################
+# Involved models for lithiation and delithiation procedure
+################################################################################
 # =====================================================
 # PHYSICAL CONSTANTS AND SCALES FOR LiFePO₄ WITH ELECTROSTATICS
 # =====================================================
@@ -771,8 +773,8 @@ def main():
             axes[0, 0].set_title("Lithium Content Evolution")
             axes[0, 0].grid(True, alpha=0.3)
             
-            # Voltage evolution
-            axes[0, 1].plot(sim.history['time_phys'], sim.history['voltage'], 'orange-', linewidth=2)
+            # Voltage evolution - FIXED: Changed 'orange-' to color='orange'
+            axes[0, 1].plot(sim.history['time_phys'], sim.history['voltage'], color='orange', linewidth=2)
             axes[0, 1].set_xlabel("Time (s)")
             axes[0, 1].set_ylabel("Voltage (V)")
             axes[0, 1].set_title("Voltage Evolution")
@@ -789,8 +791,8 @@ def main():
             axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
             
-            # Electric potential
-            axes[1, 1].plot(sim.history['time_phys'], sim.history['mean_phi'], 'purple-', linewidth=2)
+            # Electric potential - FIXED: Changed 'purple-' to color='purple'
+            axes[1, 1].plot(sim.history['time_phys'], sim.history['mean_phi'], color='purple', linewidth=2)
             axes[1, 1].set_xlabel("Time (s)")
             axes[1, 1].set_ylabel("Mean φ (V)")
             axes[1, 1].set_title("Electric Potential Evolution")
