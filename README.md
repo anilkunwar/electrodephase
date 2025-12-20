@@ -5,3 +5,5 @@
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition2-streamlit-red)](https://electrode-phasedecomposition2.streamlit.app/)
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition3-streamlit-red)](https://electrode-phasedecomposition3.streamlit.app/)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition4-streamlit-red)](https://electrode-phasedecomposition4.streamlit.app/)  (with basics of phase decomposition simulation)
