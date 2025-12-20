@@ -8,4 +8,10 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition4-streamlit-red)](https://electrode-phasedecomposition4.streamlit.app/)  (with basics of phase decomposition simulation - generic A <--> B phase decomposition)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition5-streamlit-red)](https://electrode-phasedecomposition5.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition5-streamlit-red)](https://electrode-phasedecomposition5.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition, preliminary and not double well based A)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition6-streamlit-red)](https://electrode-phasedecomposition6.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and not double well based B)
+
+
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition7-streamlit-red)](https://electrode-phasedecomposition7.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based B)
