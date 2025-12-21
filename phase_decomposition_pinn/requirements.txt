@@ -1,1 +1,7 @@
-
+streamlit 
+plotly
+scipy
+torch
+matplotlib
+seaborn
+pyvista
