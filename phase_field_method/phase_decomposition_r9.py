@@ -113,7 +113,7 @@ def compute_laplacian(field, dx):
             jp1 = (j + 1) % ny
             
             if i == 0:  # Left boundary, one-sided
-                lap[i, j] = (field[i+1, j] + field[i, j] +  # assume mirror for i-1 = i+1? No, for no-flux, adjust
+                lap[i, j] = (field[i+1, j] + field[i, j] + 
                              field[i, jp1] + field[i, jm1] - 4.0 * field[i, j]) / (dx * dx)
             elif i == nx-1:  # Right boundary, no-flux, one-sided
                 lap[i, j] = (field[i, j] + field[i-1, j] +
@@ -163,9 +163,9 @@ def bv_flux(eta_tilde, c, alpha, J0_tilde):
 def mhc_flux(eta_tilde, lambda_mhc, tau, J0_tilde):
     """Dimensionless MHC flux (approx from Hamadi/Bazant)"""
     exp_term = (np.exp(eta_tilde) - np.exp(-eta_tilde)) / (np.exp(eta_tilde) + np.exp(-eta_tilde) + 2)
-    erfc_arg = (lambda_mhc - 1 + eta_tilde**2 / (2 * np.sqrt(lambda_mhc))) / (1 + np.sqrt(lambda_mhc))  # simplified, check exact
-    erfc_val = np.exp(-erfc_arg**2) / np.sqrt(np.pi) - erfc_arg * (2 / np.sqrt(np.pi)) * np.exp(-erfc_arg**2)  # approx erfc
-    return tau * J0_tilde * np.sqrt(np.pi * lambda_mhc) * exp_term * erfc_val  # approximate
+    erfc_arg = (lambda_mhc - 1 + eta_tilde**2 / (2 * np.sqrt(lambda_mhc))) / (1 + np.sqrt(lambda_mhc))  # simplified
+    erfc_val = 1 / (1 + np.exp(erfc_arg))  # simple sigmoid approx for erfc
+    return tau * J0_tilde * np.sqrt(np.pi * lambda_mhc) * exp_term * erfc_val  # rough approx; refine if needed
 
 @njit(fastmath=True)
 def find_eta(I_tilde_target, c_boundary, kinetics_type, alpha, lambda_mhc, tau, J0_tilde, ny):
@@ -398,6 +398,14 @@ class PhaseFieldSimulation:
         lap_c = compute_laplacian(self.c, self.dx)
         return chemical_potential(self.c, self.A, self.B, self.C) - self.kappa_dim * lap_c
    
+    def compute_free_energy_density(self):
+        energy = double_well_energy(self.c, self.A, self.B, self.C)
+        grad_x = compute_gradient_x(self.c, self.dx)
+        grad_y = compute_gradient_y(self.c, self.dx)
+        grad_sq = grad_x**2 + grad_y**2
+        energy += 0.5 * self.kappa_dim * grad_sq
+        return energy
+   
     def get_statistics(self):
         stats = {
             'time_phys': self.time_phys,
@@ -497,7 +505,7 @@ def main():
             st.metric("x in LiₓFePO₄", f"{stats['mean_c']:.3f}")
             st.metric("Voltage", f"{stats['voltage']:.3f} V")
        
-        with col_stat2:
+        with col2:
             st.metric("FePO₄", f"{stats['phase_FePO4']:.3f}")
             st.metric("LiFePO₄", f"{stats['phase_LiFePO4']:.3f}")
             st.metric("Overpotential ~η", f"{sim.history['eta_tilde'][-1]:.3f}" if sim.history['eta_tilde'] else 0.0)
