@@ -64,6 +64,11 @@ class PhysicalScalesWithC_Rate:
         # Set characteristic scales (same scaling as original)
         self.set_scales()
         
+        # Calculate Debye length (same as original)
+        self.c_ref = 0.5
+        c_ref_moles_per_m3 = self.c_ref * (1/self.V_m)
+        self.λ_D = np.sqrt(self.ε * self.R * self.T / (self.F**2 * c_ref_moles_per_m3))
+        
         print(f"Physical scales at {c_rate}C:")
         print(f"  Domain: {self.L0*1e9:.1f} nm")
         print(f"  Time scale: {self.t0:.2e} s")
@@ -390,7 +395,7 @@ class EnhancedSingleParticleSimulation:
             'mean_c': [],
             'std_c': [],
             'mean_phi': [],
-            'voltage': [],
+            'voltage': [],  # Fixed: Added voltage key
             'phase_FePO4': [],
             'phase_LiFePO4': [],
             'nuclei_active': [],
@@ -548,7 +553,7 @@ class EnhancedSingleParticleSimulation:
             'mean_c': [],
             'std_c': [],
             'mean_phi': [],
-            'voltage': [],
+            'voltage': [],  # Fixed: Added voltage key
             'phase_FePO4': [],
             'phase_LiFePO4': [],
             'nuclei_active': [],
@@ -563,7 +568,7 @@ class EnhancedSingleParticleSimulation:
         self.history['std_c'].append(np.std(self.c))
         self.history['mean_phi'].append(np.mean(self.phi))
         
-        # Voltage (same as original)
+        # Voltage (same as original) - Fixed: Now properly stored
         voltage = np.mean(self.phi[-1, :]) - np.mean(self.phi[0, :])
         self.history['voltage'].append(voltage)
         
@@ -665,6 +670,12 @@ class EnhancedSingleParticleSimulation:
         seeds_info = self.get_seeds_info()
         active_seeds = sum(1 for s in seeds_info if s['is_growing'])
         
+        # Calculate voltage if history exists, otherwise compute from current phi
+        if self.history['voltage']:
+            current_voltage = self.history['voltage'][-1]
+        else:
+            current_voltage = np.mean(self.phi[-1, :]) - np.mean(self.phi[0, :]) if self.phi.size > 0 else 0.0
+        
         stats = {
             # Time
             'time_phys': self.time_phys,
@@ -677,17 +688,17 @@ class EnhancedSingleParticleSimulation:
             'x_Li': np.mean(self.c),  # Same as original
             
             # Electric field (same as original)
-            'mean_phi': np.mean(self.phi),
-            'max_phi': np.max(self.phi),
-            'min_phi': np.min(self.phi),
-            'mean_E': np.mean(np.sqrt(self.Ex**2 + self.Ey**2)),
+            'mean_phi': np.mean(self.phi) if self.phi.size > 0 else 0.0,
+            'max_phi': np.max(self.phi) if self.phi.size > 0 else 0.0,
+            'min_phi': np.min(self.phi) if self.phi.size > 0 else 0.0,
+            'mean_E': np.mean(np.sqrt(self.Ex**2 + self.Ey**2)) if self.Ex.size > 0 else 0.0,
             
-            # Voltage (same as original)
-            'voltage': np.mean(self.phi[-1, :]) - np.mean(self.phi[0, :]),
+            # Voltage - FIXED: Now properly defined
+            'voltage': current_voltage,
             
             # Phase fractions (same as original)
-            'phase_FePO4': np.sum(self.c < 0.5) / (self.nx * self.ny),
-            'phase_LiFePO4': np.sum(self.c >= 0.5) / (self.nx * self.ny),
+            'phase_FePO4': np.sum(self.c < 0.5) / (self.nx * self.ny) if self.c.size > 0 else 0.0,
+            'phase_LiFePO4': np.sum(self.c >= 0.5) / (self.nx * self.ny) if self.c.size > 0 else 0.0,
             
             # Seeds
             'n_seeds': len(self.seed_positions),
@@ -702,7 +713,7 @@ class EnhancedSingleParticleSimulation:
             
             # Physical parameters (same as original)
             'domain_size_nm': self.nx * self.dx * self.scales.L0 * 1e9,
-            'interface_width_nm': np.sqrt(self.kappa_phys / self.W_phys) * 1e9,
+            'interface_width_nm': np.sqrt(self.kappa_phys / self.W_phys) * 1e9 if self.W_phys > 0 else 0.0,
             'debye_length_nm': self.scales.λ_D * 1e9,
             
             # Dimensionless parameters (same as original)
@@ -836,22 +847,33 @@ def main():
         
         st.divider()
         
-        # Display statistics
+        # Display statistics - FIXED: Using safe access with .get() method
         st.subheader("📊 Current State")
         stats = sim.get_statistics()
         
+        # Safe access to statistics with defaults
+        time_phys = stats.get('time_phys', 0.0)
+        mean_c = stats.get('mean_c', 0.5)
+        voltage = stats.get('voltage', 0.0)
+        active_seeds = stats.get('active_seeds', 0)
+        n_seeds_total = stats.get('n_seeds', sim.n_seeds)
+        phase_FePO4 = stats.get('phase_FePO4', 0.0)
+        phase_LiFePO4 = stats.get('phase_LiFePO4', 0.0)
+        current_c_rate = stats.get('c_rate', sim.c_rate)
+        kinetics_type_name = stats.get('kinetics_type', 'BV')
+        
         col_stat1, col_stat2 = st.columns(2)
         with col_stat1:
-            st.metric("Time", f"{stats['time_phys']:.2e} s")
-            st.metric("x in LiₓFePO₄", f"{stats['mean_c']:.3f}")
-            st.metric("Voltage", f"{stats['voltage']:.3f} V")
-            st.metric("Active Seeds", f"{stats['active_seeds']}/{stats['n_seeds']}")
+            st.metric("Time", f"{time_phys:.2e} s")
+            st.metric("x in LiₓFePO₄", f"{mean_c:.3f}")
+            st.metric("Voltage", f"{voltage:.3f} V")
+            st.metric("Active Seeds", f"{active_seeds}/{n_seeds_total}")
         
         with col_stat2:
-            st.metric("FePO₄", f"{stats['phase_FePO4']:.3f}")
-            st.metric("LiFePO₄", f"{stats['phase_LiFePO4']:.3f}")
-            st.metric("C-Rate", f"{stats['c_rate']}C")
-            st.metric("Kinetics", stats['kinetics_type'])
+            st.metric("FePO₄", f"{phase_FePO4:.3f}")
+            st.metric("LiFePO₄", f"{phase_LiFePO4:.3f}")
+            st.metric("C-Rate", f"{current_c_rate}C")
+            st.metric("Kinetics", kinetics_type_name)
     
     # Main content tabs
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -880,9 +902,9 @@ def main():
                           edgecolors='black', linewidth=1, alpha=0.7)
             
             ax1.set_title(f"LiₓFePO₄ Concentration\n"
-                         f"Time: {stats['time_phys']:.2e} s, "
+                         f"Time: {stats.get('time_phys', 0.0):.2e} s, "
                          f"C-rate: {sim.c_rate}C, "
-                         f"Seeds: {stats['active_seeds']}/{stats['n_seeds']}")
+                         f"Seeds: {active_seeds}/{n_seeds_total}")
             ax1.set_xlabel(f"x ({domain_nm:.0f} nm)")
             ax1.set_ylabel(f"y ({domain_nm:.0f} nm)")
             plt.colorbar(im1, ax=ax1, label='x in LiₓFePO₄')
@@ -894,9 +916,15 @@ def main():
             
             fig_pie, ax_pie = plt.subplots(figsize=(4, 4))
             labels = ['FePO₄-rich', 'LiFePO₄-rich']
-            sizes = [stats['phase_FePO4'], stats['phase_LiFePO4']]
+            sizes = [phase_FePO4, phase_LiFePO4]
             colors = ['#ff6b6b', '#4ecdc4']
-            ax_pie.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+            
+            # Only show pie chart if we have valid data
+            if sum(sizes) > 0:
+                ax_pie.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+            else:
+                ax_pie.text(0.5, 0.5, 'No data', ha='center', va='center')
+            
             ax_pie.axis('equal')
             st.pyplot(fig_pie)
             plt.close(fig_pie)
@@ -911,8 +939,11 @@ def main():
                     'Status': 'Growing' if seed['is_growing'] else 'Dormant'
                 })
             
-            df_seeds = pd.DataFrame(seeds_data)
-            st.dataframe(df_seeds, use_container_width=True)
+            if seeds_data:
+                df_seeds = pd.DataFrame(seeds_data)
+                st.dataframe(df_seeds, use_container_width=True)
+            else:
+                st.info("No seeds data available")
     
     with tab2:
         col1, col2 = st.columns(2)
@@ -946,29 +977,41 @@ def main():
         if len(sim.history['time_phys']) > 1:
             fig4, axes = plt.subplots(2, 2, figsize=(12, 8))
             
-            axes[0, 0].plot(sim.history['time_phys'], sim.history['mean_c'], 'b-', linewidth=2)
+            # Use .get() for safe access to history data
+            time_data = sim.history.get('time_phys', [])
+            mean_c_data = sim.history.get('mean_c', [])
+            voltage_data = sim.history.get('voltage', [])
+            phase_FePO4_data = sim.history.get('phase_FePO4', [])
+            phase_LiFePO4_data = sim.history.get('phase_LiFePO4', [])
+            nuclei_active_data = sim.history.get('nuclei_active', [])
+            
+            if time_data and mean_c_data:
+                axes[0, 0].plot(time_data, mean_c_data, 'b-', linewidth=2)
             axes[0, 0].set_xlabel("Time (s)")
             axes[0, 0].set_ylabel("Mean x")
             axes[0, 0].set_title("Concentration Evolution")
             axes[0, 0].grid(True, alpha=0.3)
             
-            axes[0, 1].plot(sim.history['time_phys'], sim.history['voltage'], color='orange', linewidth=2)
+            if time_data and voltage_data:
+                axes[0, 1].plot(time_data, voltage_data, color='orange', linewidth=2)
             axes[0, 1].set_xlabel("Time (s)")
             axes[0, 1].set_ylabel("Voltage (V)")
             axes[0, 1].set_title("Voltage Profile")
             axes[0, 1].grid(True, alpha=0.3)
             
-            axes[1, 0].plot(sim.history['time_phys'], sim.history['phase_FePO4'], 'r-', 
-                           label='FePO₄', linewidth=2)
-            axes[1, 0].plot(sim.history['time_phys'], sim.history['phase_LiFePO4'], 'g-', 
-                           label='LiFePO₄', linewidth=2)
+            if time_data and phase_FePO4_data and phase_LiFePO4_data:
+                axes[1, 0].plot(time_data, phase_FePO4_data, 'r-', 
+                               label='FePO₄', linewidth=2)
+                axes[1, 0].plot(time_data, phase_LiFePO4_data, 'g-', 
+                               label='LiFePO₄', linewidth=2)
+                axes[1, 0].legend()
             axes[1, 0].set_xlabel("Time (s)")
             axes[1, 0].set_ylabel("Phase Fraction")
             axes[1, 0].set_title("Phase Evolution")
-            axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
             
-            axes[1, 1].plot(sim.history['time_phys'], sim.history['nuclei_active'], 'purple', linewidth=2)
+            if time_data and nuclei_active_data:
+                axes[1, 1].plot(time_data, nuclei_active_data, 'purple', linewidth=2)
             axes[1, 1].set_xlabel("Time (s)")
             axes[1, 1].set_ylabel("Active Nuclei")
             axes[1, 1].set_title("Active Nuclei Evolution")
@@ -1007,68 +1050,33 @@ def main():
         """)
         
         # Interface analysis
-        grad_x = np.gradient(sim.c, axis=0)
-        grad_y = np.gradient(sim.c, axis=1)
-        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        
-        fig5, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        axes[0].imshow(grad_mag.T, cmap='hot', origin='lower', aspect='auto')
-        axes[0].set_title("Gradient Magnitude (Interface)")
-        axes[0].set_xlabel("x")
-        axes[0].set_ylabel("y")
-        
-        # Histogram of concentration
-        axes[1].hist(sim.c.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
-        axes[1].axvline(sim.scales.c_alpha, color='red', linestyle='--', label='FePO₄')
-        axes[1].axvline(sim.scales.c_beta, color='green', linestyle='--', label='LiFePO₄')
-        axes[1].set_xlabel('x in LiₓFePO₄')
-        axes[1].set_ylabel('Frequency')
-        axes[1].set_title('Concentration Distribution')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        st.pyplot(fig5)
-        plt.close(fig5)
-    
-    # Physics explanation
-    with st.expander("📚 C-Rate in Single Particle Simulation", expanded=True):
-        st.markdown(f"""
-        ### How C-Rate Affects Single Particle Behavior:
-        
-        **1. Overpotential Scaling:**
-        ```
-        η ∝ log(C-rate)  (Butler-Volmer equation)
-        ```
-        - Low C-rate (0.1C): η ≈ 10 mV
-        - High C-rate (5C): η ≈ 50-100 mV
-        
-        **2. Nucleation Probability:**
-        - **High C-rate**: Fewer active seeds (competition limited)
-        - **Low C-rate**: More simultaneous nucleation
-        
-        **3. Interface Dynamics:**
-        - **High C-rate**: Sharper interface (κ factor = {sim.scales.kappa_factor:.2f})
-        - **Low C-rate**: Diffuser interface (κ factor = 1.0)
-        
-        **4. Effective Diffusion:**
-        ```
-        D_eff = D₀ / (1 + α·√C-rate)
-        ```
-        - Accounts for kinetic limitations at high rates
-        
-        **5. Transformation Time:**
-        - **1C**: Complete in ~1 hour (theoretical)
-        - **5C**: Complete in ~12 minutes
-        - **0.1C**: Complete in ~10 hours
-        
-        ### Numerical Implementation:
-        - **Same dimensionless scaling** as original code
-        - **C-rate multiplies** key parameters
-        - **Physical time scaling** preserved
-        - **Consistent with** experimental paper observations
-        """)
+        if sim.c.size > 0:
+            grad_x = np.gradient(sim.c, axis=0)
+            grad_y = np.gradient(sim.c, axis=1)
+            grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+            
+            fig5, axes = plt.subplots(1, 2, figsize=(12, 5))
+            
+            axes[0].imshow(grad_mag.T, cmap='hot', origin='lower', aspect='auto')
+            axes[0].set_title("Gradient Magnitude (Interface)")
+            axes[0].set_xlabel("x")
+            axes[0].set_ylabel("y")
+            
+            # Histogram of concentration
+            axes[1].hist(sim.c.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
+            axes[1].axvline(sim.scales.c_alpha, color='red', linestyle='--', label='FePO₄')
+            axes[1].axvline(sim.scales.c_beta, color='green', linestyle='--', label='LiFePO₄')
+            axes[1].set_xlabel('x in LiₓFePO₄')
+            axes[1].set_ylabel('Frequency')
+            axes[1].set_title('Concentration Distribution')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig5)
+            plt.close(fig5)
+        else:
+            st.info("Run simulation to see interface analysis")
 
 if __name__ == "__main__":
     main()
