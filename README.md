@@ -1,5 +1,10 @@
 # Phase Decomposition in Li-ion Battery Electrode
 
+# physics informed nerual network
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecompositionpinn1-streamlit-red)](https://lixfepo4-electrodephase-pinn1.streamlit.app/)
+
+# phase field method 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition1-streamlit-red)](https://electrode-phasedecomposition1.streamlit.app/)
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition2-streamlit-red)](https://electrode-phasedecomposition2.streamlit.app/)
