@@ -329,7 +329,7 @@ def compute_electric_field(phi, dx):
 class ElectrochemicalPhaseFieldSimulation:
     """Phase field simulation with electrostatics for LiFePO₄"""
    
-    def __init__(self, nx=256, ny=256, dx=1.0, dt=0.1, c_rate=1.0):
+    def __init__(self, nx=256, ny=256, dx=1.0, dt=0.01, c_rate=1.0):
         # Simulation grid
         self.nx = nx
         self.ny = ny
@@ -427,27 +427,38 @@ class ElectrochemicalPhaseFieldSimulation:
         self.step = 0
         self.clear_history()
    
-    def initialize_lithiation(self, noise_amplitude=0.05, seed=None):
-        """Initialize for lithiation: FePO₄ with LiFePO₄ seed at left boundary"""
+    def initialize_lithiation(self, noise_amplitude=0.1, seed=None):
+        """Initialize for lithiation: FePO₄ with random LiFePO₄ seeds"""
         if seed is not None:
             np.random.seed(seed)
         # Start with FePO₄
         self.c = self.scales.c_alpha * np.ones((self.nx, self.ny))
        
-        # Add LiFePO₄ seed at left boundary
-        seed_width = self.ny // 10
-        for j in range(self.ny):
-            if abs(j - self.ny//2) < seed_width:
-                self.c[:10, j] = self.scales.c_beta
+        # Create multiple random seeds of LiFePO₄ (not rectangular)
+        n_seeds = 5
+        for _ in range(n_seeds):
+            # Random position
+            seed_x = np.random.randint(10, self.nx - 10)
+            seed_y = np.random.randint(10, self.ny - 10)
+            seed_radius = np.random.randint(3, 8)
+           
+            # Create circular seed
+            for i in range(max(0, seed_x - seed_radius), min(self.nx, seed_x + seed_radius)):
+                for j in range(max(0, seed_y - seed_radius), min(self.ny, seed_y + seed_radius)):
+                    dist = np.sqrt((i - seed_x)**2 + (j - seed_y)**2)
+                    if dist <= seed_radius:
+                        # Blend between FePO₄ and LiFePO₄ based on distance
+                        blend = 1.0 - dist / seed_radius
+                        self.c[i, j] = self.scales.c_alpha + blend * (self.scales.c_beta - self.scales.c_alpha)
        
-        # Add noise
+        # Add noise to entire domain
         self.c += noise_amplitude * (2.0 * np.random.random((self.nx, self.ny)) - 1.0)
         self.c = np.minimum(1.0, np.maximum(0.0, self.c))
        
-        # Apply electric potential gradient
+        # Apply electric potential gradient (negative for lithiation)
         self.phi = np.zeros_like(self.c)
         for i in range(self.nx):
-            self.phi[i, :] = -0.1 * (i / self.nx)
+            self.phi[i, :] = -0.15 * (i / self.nx)
        
         self.eta_left = self.scales.eta_scale
         self.time_dim = 0.0
@@ -455,27 +466,38 @@ class ElectrochemicalPhaseFieldSimulation:
         self.step = 0
         self.clear_history()
    
-    def initialize_delithiation(self, noise_amplitude=0.05, seed=None):
-        """Initialize for delithiation: LiFePO₄ with FePO₄ seed at left boundary"""
+    def initialize_delithiation(self, noise_amplitude=0.1, seed=None):
+        """Initialize for delithiation: LiFePO₄ with random FePO₄ seeds"""
         if seed is not None:
             np.random.seed(seed)
         # Start with LiFePO₄
         self.c = self.scales.c_beta * np.ones((self.nx, self.ny))
        
-        # Add FePO₄ seed at left boundary
-        seed_width = self.ny // 10
-        for j in range(self.ny):
-            if abs(j - self.ny//2) < seed_width:
-                self.c[:10, j] = self.scales.c_alpha
+        # Create multiple random seeds of FePO₄ (not rectangular)
+        n_seeds = 5
+        for _ in range(n_seeds):
+            # Random position
+            seed_x = np.random.randint(10, self.nx - 10)
+            seed_y = np.random.randint(10, self.ny - 10)
+            seed_radius = np.random.randint(3, 8)
+           
+            # Create circular seed
+            for i in range(max(0, seed_x - seed_radius), min(self.nx, seed_x + seed_radius)):
+                for j in range(max(0, seed_y - seed_radius), min(self.ny, seed_y + seed_radius)):
+                    dist = np.sqrt((i - seed_x)**2 + (j - seed_y)**2)
+                    if dist <= seed_radius:
+                        # Blend between LiFePO₄ and FePO₄ based on distance
+                        blend = 1.0 - dist / seed_radius
+                        self.c[i, j] = self.scales.c_beta - blend * (self.scales.c_beta - self.scales.c_alpha)
        
-        # Add noise
+        # Add noise to entire domain
         self.c += noise_amplitude * (2.0 * np.random.random((self.nx, self.ny)) - 1.0)
         self.c = np.minimum(1.0, np.maximum(0.0, self.c))
        
-        # Apply electric potential gradient
+        # Apply electric potential gradient (positive for delithiation)
         self.phi = np.zeros_like(self.c)
         for i in range(self.nx):
-            self.phi[i, :] = 0.1 * (i / self.nx)
+            self.phi[i, :] = 0.15 * (i / self.nx)
        
         self.eta_left = -self.scales.eta_scale
         self.time_dim = 0.0
@@ -567,6 +589,11 @@ class ElectrochemicalPhaseFieldSimulation:
         for _ in range(n_steps):
             self.run_step()
    
+    def run_until(self, target_time_phys):
+        """Run until reaching target physical time"""
+        steps_needed = max(1, int((target_time_phys - self.time_phys) / self.dt_phys))
+        self.run_steps(steps_needed)
+   
     def compute_free_energy_density(self):
         """Compute free energy density"""
         energy = double_well_energy(self.c, self.A, self.B, self.C)
@@ -646,13 +673,17 @@ def main():
         st.session_state.sim = ElectrochemicalPhaseFieldSimulation(nx=256, ny=256, dx=1.0, dt=0.01, c_rate=1.0)
    
     sim = st.session_state.sim
+    
+    # Store initial concentration for random case
+    if 'initial_c0' not in st.session_state:
+        st.session_state.initial_c0 = 0.5
    
     # Sidebar
     with st.sidebar:
         st.header("🎛️ Simulation Controls")
        
         # Display physical parameters
-        with st.expander("⚡ Electrostatic Parameters", expanded=True):
+        with st.expander("⚡ Electrostatic Parameters", expanded=False):
             stats = sim.get_statistics()
             st.markdown(f"""
             **Debye Length:** {stats['debye_length_nm']:.2f} nm
@@ -682,42 +713,82 @@ def main():
        
         # Random seed
         random_seed = st.number_input("Random Seed (optional)", value=None, step=1)
+        
+        # Initial concentration slider for random case
+        initial_c0 = st.slider(
+            "Initial x in LiₓFePO₄ (for Random case)",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.initial_c0,
+            step=0.01,
+            help="Initial lithium concentration for the random initialization"
+        )
+        st.session_state.initial_c0 = initial_c0
        
-        # Simulation control
-        col1, col2 = st.columns(2)
-        with col1:
-            steps = st.number_input("Steps/update", 1, 500, 10)
-       
-        with col2:
+        st.divider()
+        
+        # Simulation time control
+        st.subheader("⏱️ Simulation Time")
+        
+        col_time1, col_time2 = st.columns(2)
+        with col_time1:
+            steps = st.number_input("Steps per run", 1, 2000, 100)
+        
+        with col_time2:
             if st.button("▶️ Run Steps", use_container_width=True):
                 with st.spinner("Running..."):
                     sim.run_steps(steps)
                     st.rerun()
+        
+        # Run to specific time
+        target_time = st.number_input(
+            "Run to time (s)",
+            min_value=0.0,
+            max_value=1e6,
+            value=min(1e5, sim.time_phys * 10),
+            step=1000.0,
+            format="%.1e"
+        )
+        
+        if st.button("⏱️ Run to Time", use_container_width=True):
+            with st.spinner(f"Running to time {target_time:.2e} s..."):
+                sim.run_until(target_time)
+                st.rerun()
        
         st.divider()
        
         # Initialization
-        st.subheader("Electrochemical Scenarios")
+        st.subheader("🔄 Initialization")
         init_option = st.radio(
             "Choose scenario:",
             ["Random (No Bias)", "Lithiation (Charge)", "Delithiation (Discharge)"],
             index=0
         )
+        
+        # Noise amplitude control
+        noise_amplitude = st.slider(
+            "Noise Amplitude",
+            min_value=0.0,
+            max_value=0.2,
+            value=0.05,
+            step=0.01,
+            help="Amplitude of random noise added to initial condition"
+        )
        
-        if st.button("🔄 Apply Scenario", use_container_width=True):
+        if st.button("🔄 Apply Initialization", use_container_width=True):
             if init_option == "Random (No Bias)":
-                sim.initialize_random(c0=0.5, noise_amplitude=0.05, seed=random_seed)
+                sim.initialize_random(c0=initial_c0, noise_amplitude=noise_amplitude, seed=random_seed)
             elif init_option == "Lithiation (Charge)":
-                sim.initialize_lithiation(noise_amplitude=0.05, seed=random_seed)
+                sim.initialize_lithiation(noise_amplitude=noise_amplitude, seed=random_seed)
             else:
-                sim.initialize_delithiation(noise_amplitude=0.05, seed=random_seed)
+                sim.initialize_delithiation(noise_amplitude=noise_amplitude, seed=random_seed)
             sim.set_parameters(c_rate=c_rate, kinetics_type=kinetics_type)
             st.rerun()
        
         st.divider()
        
         # Parameter controls
-        st.subheader("Model Parameters")
+        st.subheader("🎛️ Model Parameters")
        
         W_dim = st.slider("W (Double-well)", 0.1, 5.0, float(sim.W_dim), 0.1)
         kappa_dim = st.slider("κ (Gradient)", 0.1, 10.0, float(sim.kappa_dim), 0.1)
@@ -755,6 +826,11 @@ def main():
             st.metric("Debye Length", f"{stats['debye_length_nm']:.2f} nm")
             st.metric("C-Rate", f"{stats['c_rate']}C")
             st.metric("Kinetics", ['PNP', 'BV', 'MHC'][stats['kinetics_type']])
+            
+        # Progress bar for simulation
+        max_sim_time = 1e6  # Maximum simulation time in seconds
+        progress = min(1.0, stats['time_phys'] / max_sim_time)
+        st.progress(progress, text=f"Simulation Progress: {progress*100:.1f}%")
    
     # Main content
     tab1, tab2, tab3, tab4 = st.tabs(["Concentration", "Potential", "Electric Field", "Statistics"])
@@ -797,11 +873,12 @@ def main():
             st.subheader("Concentration Distribution")
             fig_hist, ax_hist = plt.subplots(figsize=(4, 3))
             ax_hist.hist(sim.c.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
-            ax_hist.axvline(sim.scales.c_alpha, color='red', linestyle='--', alpha=0.7)
-            ax_hist.axvline(sim.scales.c_beta, color='green', linestyle='--', alpha=0.7)
+            ax_hist.axvline(sim.scales.c_alpha, color='red', linestyle='--', alpha=0.7, label='FePO₄')
+            ax_hist.axvline(sim.scales.c_beta, color='green', linestyle='--', alpha=0.7, label='LiFePO₄')
             ax_hist.set_xlim(0, 1)
             ax_hist.set_xlabel('x in LiₓFePO₄')
             ax_hist.set_ylabel('Frequency')
+            ax_hist.legend()
             ax_hist.grid(True, alpha=0.3)
             st.pyplot(fig_hist)
             plt.close(fig_hist)
@@ -927,7 +1004,7 @@ def main():
             st.info("Run simulation to see time evolution statistics.")
    
     # Physics explanation
-    with st.expander("📚 Governing Equations with Electrostatics", expanded=True):
+    with st.expander("📚 Governing Equations with Electrostatics", expanded=False):
         st.markdown("""
         ### Extended Cahn-Hilliard Equation with Electrostatics or Kinetics
        
@@ -948,16 +1025,22 @@ def main():
         5. **Poisson Equation** (always):
            ∇²φ = -F/ε * (c - c_ref)
        
-        ### Additions:
-        - C-rate scales overpotential, interface width, diffusion.
-        - Random noise and seeds for all cases.
-        - BV/MHC replace migration term when selected.
+        ### Key Improvements:
+        - **No rectangular seeds**: Random circular seeds for more realistic nucleation
+        - **Extended simulation time**: Run up to 1e6 seconds (≈11.5 days)
+        - **Flexible initial conditions**: Slider for initial x in LiₓFePO₄ (0-1)
+        - **Progress tracking**: Visual progress bar for long simulations
+       
+        ### C-Rate Effects:
+        - **Low C-rate (≤1C)**: Gradual transformation, lower overpotential
+        - **High C-rate (>1C)**: Faster transformation, higher overpotential
+        - **Rate-dependent parameters**: Interface sharpness and mobility scale with C-rate
         """)
 
     # Auto-run option
     st.sidebar.divider()
     auto_run = st.sidebar.checkbox("Auto-run simulation", value=False)
-    auto_speed = st.sidebar.slider("Steps per second", 1, 50, 10)
+    auto_speed = st.sidebar.slider("Auto-run speed (steps/sec)", 1, 100, 20)
    
     if auto_run:
         placeholder = st.empty()
@@ -971,7 +1054,7 @@ def main():
                 for i in range(auto_speed):
                     sim.run_step()
                     progress_bar.progress((i + 1) / auto_speed)
-                    status_text.text(f"Step {sim.step}, Time: {sim.time_phys:.2e} s")
+                    status_text.text(f"Step {sim.step}, Time: {sim.time_phys:.2e} s, x: {np.mean(sim.c):.3f}")
                
                 st.rerun()
 
