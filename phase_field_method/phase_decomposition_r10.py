@@ -427,78 +427,50 @@ class ElectrochemicalPhaseFieldSimulation:
         self.step = 0
         self.clear_history()
    
-    def initialize_lithiation(self, noise_amplitude=0.1, seed=None):
-        """Initialize for lithiation: FePO₄ with random LiFePO₄ seeds"""
+    def initialize_lithiation(self, noise_amplitude=0.05, seed=None):
+        """Initialize for lithiation: Uniform FePO₄ with only random noise"""
         if seed is not None:
             np.random.seed(seed)
-        # Start with FePO₄
+            
+        # Start with uniform FePO₄ (c_alpha)
         self.c = self.scales.c_alpha * np.ones((self.nx, self.ny))
-       
-        # Create multiple random seeds of LiFePO₄ (not rectangular)
-        n_seeds = 5
-        for _ in range(n_seeds):
-            # Random position
-            seed_x = np.random.randint(10, self.nx - 10)
-            seed_y = np.random.randint(10, self.ny - 10)
-            seed_radius = np.random.randint(3, 8)
-           
-            # Create circular seed
-            for i in range(max(0, seed_x - seed_radius), min(self.nx, seed_x + seed_radius)):
-                for j in range(max(0, seed_y - seed_radius), min(self.ny, seed_y + seed_radius)):
-                    dist = np.sqrt((i - seed_x)**2 + (j - seed_y)**2)
-                    if dist <= seed_radius:
-                        # Blend between FePO₄ and LiFePO₄ based on distance
-                        blend = 1.0 - dist / seed_radius
-                        self.c[i, j] = self.scales.c_alpha + blend * (self.scales.c_beta - self.scales.c_alpha)
-       
-        # Add noise to entire domain
+        
+        # Add only random noise - NO pre-existing seeds
         self.c += noise_amplitude * (2.0 * np.random.random((self.nx, self.ny)) - 1.0)
         self.c = np.minimum(1.0, np.maximum(0.0, self.c))
-       
+        
         # Apply electric potential gradient (negative for lithiation)
+        # Stronger gradient at left boundary to drive insertion
         self.phi = np.zeros_like(self.c)
         for i in range(self.nx):
-            self.phi[i, :] = -0.15 * (i / self.nx)
-       
+            # Exponential decay from left boundary
+            self.phi[i, :] = -0.2 * np.exp(-i / (self.nx * 0.2))
+        
         self.eta_left = self.scales.eta_scale
         self.time_dim = 0.0
         self.time_phys = 0.0
         self.step = 0
         self.clear_history()
    
-    def initialize_delithiation(self, noise_amplitude=0.1, seed=None):
-        """Initialize for delithiation: LiFePO₄ with random FePO₄ seeds"""
+    def initialize_delithiation(self, noise_amplitude=0.05, seed=None):
+        """Initialize for delithiation: Uniform LiFePO₄ with only random noise"""
         if seed is not None:
             np.random.seed(seed)
-        # Start with LiFePO₄
+            
+        # Start with uniform LiFePO₄ (c_beta)
         self.c = self.scales.c_beta * np.ones((self.nx, self.ny))
-       
-        # Create multiple random seeds of FePO₄ (not rectangular)
-        n_seeds = 5
-        for _ in range(n_seeds):
-            # Random position
-            seed_x = np.random.randint(10, self.nx - 10)
-            seed_y = np.random.randint(10, self.ny - 10)
-            seed_radius = np.random.randint(3, 8)
-           
-            # Create circular seed
-            for i in range(max(0, seed_x - seed_radius), min(self.nx, seed_x + seed_radius)):
-                for j in range(max(0, seed_y - seed_radius), min(self.ny, seed_y + seed_radius)):
-                    dist = np.sqrt((i - seed_x)**2 + (j - seed_y)**2)
-                    if dist <= seed_radius:
-                        # Blend between LiFePO₄ and FePO₄ based on distance
-                        blend = 1.0 - dist / seed_radius
-                        self.c[i, j] = self.scales.c_beta - blend * (self.scales.c_beta - self.scales.c_alpha)
-       
-        # Add noise to entire domain
+        
+        # Add only random noise - NO pre-existing seeds
         self.c += noise_amplitude * (2.0 * np.random.random((self.nx, self.ny)) - 1.0)
         self.c = np.minimum(1.0, np.maximum(0.0, self.c))
-       
+        
         # Apply electric potential gradient (positive for delithiation)
+        # Stronger gradient at left boundary to drive extraction
         self.phi = np.zeros_like(self.c)
         for i in range(self.nx):
-            self.phi[i, :] = 0.15 * (i / self.nx)
-       
+            # Exponential decay from left boundary
+            self.phi[i, :] = 0.2 * np.exp(-i / (self.nx * 0.2))
+        
         self.eta_left = -self.scales.eta_scale
         self.time_dim = 0.0
         self.time_phys = 0.0
@@ -1025,16 +997,20 @@ def main():
         5. **Poisson Equation** (always):
            ∇²φ = -F/ε * (c - c_ref)
        
+        ### Initial Conditions:
+        - **Random (No Bias)**: Uniform x with random noise (x controlled by slider)
+        - **Lithiation (Charge)**: Uniform FePO₄ (x≈0.03) + noise, negative electric field at left
+        - **Delithiation (Discharge)**: Uniform LiFePO₄ (x≈0.97) + noise, positive electric field at left
+       
         ### Key Improvements:
-        - **No rectangular seeds**: Random circular seeds for more realistic nucleation
+        - **No artificial seeds**: Lithiation/delithiation start with truly uniform compositions
+        - **Exponential potential**: Stronger electric field at left boundary decays exponentially
+        - **Proper nucleation**: Phase boundaries form naturally from noise under electric field
         - **Extended simulation time**: Run up to 1e6 seconds (≈11.5 days)
-        - **Flexible initial conditions**: Slider for initial x in LiₓFePO₄ (0-1)
-        - **Progress tracking**: Visual progress bar for long simulations
        
         ### C-Rate Effects:
         - **Low C-rate (≤1C)**: Gradual transformation, lower overpotential
         - **High C-rate (>1C)**: Faster transformation, higher overpotential
-        - **Rate-dependent parameters**: Interface sharpness and mobility scale with C-rate
         """)
 
     # Auto-run option
