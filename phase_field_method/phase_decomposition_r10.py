@@ -704,7 +704,7 @@ def main():
         
         col_time1, col_time2 = st.columns(2)
         with col_time1:
-            steps = st.number_input("Steps per run", 1, 2000, 100)
+            steps = st.number_input("Steps per run", 1, 20000, 100)
         
         with col_time2:
             if st.button("▶️ Run Steps", use_container_width=True):
