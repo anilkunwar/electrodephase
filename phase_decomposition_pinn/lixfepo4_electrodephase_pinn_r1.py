@@ -8,7 +8,6 @@ from matplotlib.colors import LinearSegmentedColormap
 import pandas as pd
 import io
 import os
-from scipy.special import erf
 import time
 from datetime import datetime
 import json
@@ -23,7 +22,6 @@ class PhysicalConstants:
         # Fundamental constants
         self.R = 8.314462618  # J/(mol·K)
         self.F = 96485.33212  # C/mol
-        self.k_B = 1.380649e-23  # J/K
         
         # LiFePO₄ specific parameters
         self.T = 298.15  # K
@@ -316,14 +314,14 @@ def boundary_conditions_loss(model, constants, geometry='cartesian_2d'):
         
         losses.append(torch.mean(c_y_top**2 + mu_y_top**2))
         
-        # Bottom boundary (y = 0)
+        # Bottom boundary (y = 0) - FIXED ERROR HERE
         x_bottom = torch.rand(100, 1, requires_grad=True) * constants.Lx
         y_bottom = torch.zeros(100, 1, requires_grad=True)
         t_bottom = torch.rand(100, 1, requires_grad=True) * constants.T_max
         
         outputs_bottom = model(x_bottom, y_bottom, t_bottom)
-        c_bottom = outputs['c']
-        mu_bottom = outputs['mu']
+        c_bottom = outputs_bottom['c']
+        mu_bottom = outputs_bottom['mu']
         
         c_y_bottom = torch.autograd.grad(c_bottom, y_bottom, grad_outputs=torch.ones_like(c_bottom),
                                         create_graph=True, retain_graph=True)[0]
@@ -565,7 +563,7 @@ def train_pinn_model(constants, geometry='cartesian_2d', include_voltage=True,
         history['pde_loss'].append(pde_loss.item())
         history['bc_loss'].append(bc_loss.item())
         history['ic_loss'].append(ic_loss.item())
-        history['voltage_loss'].append(voltage_loss.item())
+        history['voltage_loss'].append(voltage_loss.item() if include_voltage else 0.0)
         history['data_loss'].append(data_loss.item())
         
         # Print progress
@@ -666,7 +664,7 @@ def plot_spherical_profile(model, constants, t_values):
             c_pred = outputs['c'].numpy().flatten()
             
             if model.include_voltage:
-                V_pred = outputs['V'].numpy().flatten()[0]
+                V_pred = outputs['V'].numpy().flatten()[0] if outputs['V'].numel() > 0 else 0.0
         
         # Plot
         ax = axes[idx]
@@ -696,14 +694,14 @@ def plot_voltage_profile(model, constants, geometry='cartesian_2d'):
         
         with torch.no_grad():
             outputs = model(x, y, t_values)
-            V_pred = outputs['V'].numpy().flatten()
+            V_pred = outputs['V'].numpy().flatten() if 'V' in outputs else np.zeros_like(t_values.numpy().flatten())
     else:
         # Use surface point for spherical
         r = torch.ones_like(t_values) * constants.particle_radius
         
         with torch.no_grad():
             outputs = model(r, t_values)
-            V_pred = outputs['V'].numpy().flatten()
+            V_pred = outputs['V'].numpy().flatten() if 'V' in outputs else np.zeros_like(t_values.numpy().flatten())
     
     # Also compute equilibrium voltage from average chemical potential
     V_eq = []
@@ -757,6 +755,14 @@ def main():
     Cahn-Hilliard phase field model for battery electrode materials.
     """)
     
+    # Initialize session state
+    if 'model_trained' not in st.session_state:
+        st.session_state.model_trained = False
+    if 'model' not in st.session_state:
+        st.session_state.model = None
+    if 'history' not in st.session_state:
+        st.session_state.history = None
+    
     # Sidebar controls
     with st.sidebar:
         st.header("🎛️ Simulation Parameters")
@@ -765,6 +771,7 @@ def main():
         geometry = st.selectbox(
             "Geometry",
             ["cartesian_2d", "spherical_1d"],
+            index=0,
             format_func=lambda x: "2D Planar Electrode" if x == "cartesian_2d" else "1D Spherical Particle"
         )
         
@@ -804,32 +811,40 @@ def main():
                 st.error("Failed to load JSON file")
         
         # Run button
-        run_simulation = st.button("🚀 Run Simulation", type="primary", use_container_width=True)
-    
-    # Initialize constants
-    constants = PhysicalConstants()
-    constants.particle_radius = particle_radius
-    constants.W *= W_scale
-    constants.M *= mobility_scale
+        if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
+            with st.spinner("Training PINN model..."):
+                # Initialize constants
+                constants = PhysicalConstants()
+                constants.particle_radius = particle_radius
+                constants.W *= W_scale
+                constants.M *= mobility_scale
+                
+                # Train model
+                model, history = train_pinn_model(
+                    constants=constants,
+                    geometry=geometry,
+                    include_voltage=include_voltage,
+                    experimental_data=experimental_data,
+                    epochs=epochs,
+                    lr=learning_rate
+                )
+                
+                # Store in session state
+                st.session_state.model_trained = True
+                st.session_state.model = model
+                st.session_state.history = history
+                st.session_state.constants = constants
+                st.session_state.geometry = geometry
+                
+                st.success("✅ Training completed!")
+                st.rerun()
     
     # Main content area
-    if run_simulation:
-        with st.spinner("Training PINN model..."):
-            # Create progress bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Train model
-            model, history = train_pinn_model(
-                constants=constants,
-                geometry=geometry,
-                include_voltage=include_voltage,
-                experimental_data=experimental_data,
-                epochs=epochs,
-                lr=learning_rate
-            )
-            
-            st.success("✅ Training completed!")
+    if st.session_state.model_trained and st.session_state.model is not None:
+        model = st.session_state.model
+        history = st.session_state.history
+        constants = st.session_state.constants
+        geometry = st.session_state.geometry
         
         # Display results
         st.header("📊 Results")
@@ -847,12 +862,12 @@ def main():
             loss_df = pd.DataFrame({
                 'Loss Type': ['Total', 'PDE', 'BC', 'IC', 'Voltage', 'Data'],
                 'Value': [
-                    history['total_loss'][-1],
-                    history['pde_loss'][-1],
-                    history['bc_loss'][-1],
-                    history['ic_loss'][-1],
-                    history['voltage_loss'][-1] if include_voltage else 0,
-                    history['data_loss'][-1]
+                    history['total_loss'][-1] if 'total_loss' in history else 0.0,
+                    history['pde_loss'][-1] if 'pde_loss' in history else 0.0,
+                    history['bc_loss'][-1] if 'bc_loss' in history else 0.0,
+                    history['ic_loss'][-1] if 'ic_loss' in history else 0.0,
+                    history['voltage_loss'][-1] if 'voltage_loss' in history else 0.0,
+                    history['data_loss'][-1] if 'data_loss' in history else 0.0
                 ]
             })
             st.dataframe(loss_df.style.format({'Value': '{:.2e}'}))
@@ -898,10 +913,11 @@ def main():
         
         else:  # spherical_1d
             # Multiple time points for spherical
+            time_options = [0.0, constants.T_max/4, constants.T_max/2, 
+                          3*constants.T_max/4, constants.T_max]
             time_points = st.multiselect(
                 "Select time points for spherical profiles",
-                options=[0.0, constants.T_max/4, constants.T_max/2, 
-                       3*constants.T_max/4, constants.T_max],
+                options=time_options,
                 default=[0.0, constants.T_max/2, constants.T_max]
             )
             
@@ -910,7 +926,7 @@ def main():
                 st.pyplot(profile_fig)
         
         # Voltage profile if enabled
-        if include_voltage:
+        if model.include_voltage:
             st.subheader("Voltage Evolution")
             voltage_fig = plot_voltage_profile(model, constants, geometry)
             st.pyplot(voltage_fig)
@@ -921,13 +937,15 @@ def main():
                 x = torch.ones((100, 1)) * constants.Lx / 2
                 y = torch.ones((100, 1)) * constants.Ly / 2
                 t = torch.tensor(t_values, dtype=torch.float32).reshape(-1, 1)
-                outputs = model(x, y, t)
+                with torch.no_grad():
+                    outputs = model(x, y, t)
+                    V_pred = outputs['V'].detach().numpy().flatten() if 'V' in outputs else np.zeros_like(t_values)
             else:
                 r = torch.ones((100, 1)) * constants.particle_radius
                 t = torch.tensor(t_values, dtype=torch.float32).reshape(-1, 1)
-                outputs = model(r, t)
-            
-            V_pred = outputs['V'].detach().numpy().flatten()
+                with torch.no_grad():
+                    outputs = model(r, t)
+                    V_pred = outputs['V'].detach().numpy().flatten() if 'V' in outputs else np.zeros_like(t_values)
             
             # Create downloadable CSV
             voltage_df = pd.DataFrame({
@@ -960,8 +978,9 @@ def main():
                     x = torch.rand(1000, 1) * constants.Lx
                     y = torch.rand(1000, 1) * constants.Ly
                     t_full = torch.full_like(x, t_val.item())
-                    outputs = model(x, y, t_full)
-                    avg_c = outputs['c'].mean().item()
+                    with torch.no_grad():
+                        outputs = model(x, y, t_full)
+                        avg_c = outputs['c'].mean().item()
                     total_mass.append(avg_c)
                 
                 mass_change = max(total_mass) - min(total_mass)
@@ -976,8 +995,9 @@ def main():
                 x = torch.rand(1000, 1) * constants.Lx
                 y = torch.rand(1000, 1) * constants.Ly
                 t = torch.full_like(x, constants.T_max)
-                outputs = model(x, y, t)
-                c = outputs['c'].detach().numpy()
+                with torch.no_grad():
+                    outputs = model(x, y, t)
+                    c = outputs['c'].detach().numpy()
                 
                 phase_FePO4 = np.sum(c < 0.5) / len(c)
                 phase_LiFePO4 = np.sum(c >= 0.5) / len(c)
@@ -994,14 +1014,15 @@ def main():
                 t = torch.full_like(x, constants.T_max)
                 
                 x.requires_grad = True
-                outputs = model(x, y, t)
-                c = outputs['c']
-                
-                c_x = torch.autograd.grad(c, x, grad_outputs=torch.ones_like(c),
-                                         create_graph=True)[0]
-                
-                interface_width = (constants.c_beta - constants.c_alpha) / torch.max(torch.abs(c_x))
-                st.metric("Interface Width", f"{interface_width.item()*1e9:.1f} nm")
+                with torch.enable_grad():
+                    outputs = model(x, y, t)
+                    c = outputs['c']
+                    
+                    c_x = torch.autograd.grad(c, x, grad_outputs=torch.ones_like(c),
+                                             create_graph=True)[0]
+                    
+                    interface_width = (constants.c_beta - constants.c_alpha) / torch.max(torch.abs(c_x))
+                    st.metric("Interface Width", f"{interface_width.item()*1e9:.1f} nm")
         
         # Model download
         st.subheader("💾 Model Export")
@@ -1027,10 +1048,11 @@ def main():
             torch.save(model_dict, buffer)
             buffer.seek(0)
             
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
                 label="Download Trained Model (.pth)",
                 data=buffer,
-                file_name=f"lifepo4_pinn_{geometry}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth",
+                file_name=f"lifepo4_pinn_{geometry}_{timestamp}.pth",
                 mime="application/octet-stream"
             )
     
@@ -1074,21 +1096,33 @@ def main():
         # Show example experimental data format
         with st.expander("📋 Example Experimental Data Format"):
             st.code("""
-            [
-                {
-                    "type": "voltage",
-                    "time": [0, 100, 200, 300, 400, 500],
-                    "voltage": [3.42, 3.41, 3.40, 3.39, 3.38, 3.37]
-                },
-                {
-                    "type": "concentration_profile",
-                    "time": 300.0,
-                    "x": [0, 10e-9, 20e-9, 30e-9, 40e-9, 50e-9],
-                    "y": [50e-9, 50e-9, 50e-9, 50e-9, 50e-9, 50e-9],
-                    "concentration": [0.1, 0.2, 0.5, 0.8, 0.9, 0.95]
-                }
-            ]
+[
+    {
+        "type": "voltage",
+        "time": [0, 100, 200, 300, 400, 500],
+        "voltage": [3.42, 3.41, 3.40, 3.39, 3.38, 3.37]
+    },
+    {
+        "type": "concentration_profile",
+        "time": 300.0,
+        "x": [0, 10e-9, 20e-9, 30e-9, 40e-9, 50e-9],
+        "y": [50e-9, 50e-9, 50e-9, 50e-9, 50e-9, 50e-9],
+        "concentration": [0.1, 0.2, 0.5, 0.8, 0.9, 0.95]
+    }
+]
             """, language="json")
+        
+        # Quick start example
+        with st.expander("🚀 Quick Start Guide"):
+            st.markdown("""
+            1. **Select Geometry**: Choose 2D planar or 1D spherical
+            2. **Enable Features**: Check voltage prediction and Butler-Volmer kinetics
+            3. **Adjust Parameters**: Modify particle size, phase separation strength
+            4. **Set Training**: Choose epochs (2000 recommended) and learning rate (1e-3)
+            5. **Optional Data**: Upload experimental data for better accuracy
+            6. **Click "Run Simulation"**: Wait for training to complete
+            7. **Explore Results**: Visualize phase decomposition and voltage profiles
+            """)
 
 if __name__ == "__main__":
     # Set random seeds for reproducibility
