@@ -6,6 +6,12 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecompositionpinn2-streamlit-red)](https://lixfepo4-electrodephase-pinn2.streamlit.app/)
 
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecompositionpinn3-streamlit-red)](https://lixfepo4-electrodephase-pinn3.streamlit.app/)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecompositionpinn4-streamlit-red)](https://lixfepo4-electrodephase-pinn4.streamlit.app/)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/genericphasedecompositionpinn5-streamlit-red)](https://generic-phasedecomposition-pinn5.streamlit.app/)  (generic)
+
 # phase field method 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition1-streamlit-red)](https://electrode-phasedecomposition1.streamlit.app/)
 
