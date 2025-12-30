@@ -1015,8 +1015,8 @@ class TrainingManager:
             self.optimizer, 
             mode='min', 
             factor=0.5, 
-            patience=100,
-            verbose=True
+            patience=100
+            #verbose=True
         )
         
         # Optional lookahead optimizer
