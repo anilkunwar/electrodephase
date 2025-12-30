@@ -128,7 +128,11 @@ class FourierFeatureMapping(nn.Module):
         
     def forward(self, x):
         """Apply Fourier features to input coordinates"""
-        proj = 2 * np.pi * x @ self.B
+        #proj = 2 * np.pi * x @ self.B
+        #return torch.cat([x, torch.sin(proj), torch.cos(proj)], dim=-1)
+        # Ensure x and B have same dtype (usually float32)
+        x = x.to(self.B.dtype)
+        proj = 2 * torch.pi * (x @ self.B)
         return torch.cat([x, torch.sin(proj), torch.cos(proj)], dim=-1)
 
 class ResidualBlock(nn.Module):
