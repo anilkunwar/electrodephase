@@ -1224,9 +1224,10 @@ class TrainingManager:
             'loss': loss,
             'history': self.history,
             'constants': {
-                k: v if not isinstance(v, torch.Tensor) else v.cpu().numpy().tolist()
-                for k, v in vars(self.constants).items()
-                if k not in ['device', '__slots__']
+                k: getattr(self.constants, k)
+                for k in self.constants.__slots__
+                if k != 'device'
+        },
             },
             'geometry': self.geometry,
             'include_voltage': self.include_voltage
