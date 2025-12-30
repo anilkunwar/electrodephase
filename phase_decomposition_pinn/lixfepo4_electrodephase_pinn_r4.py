@@ -1069,6 +1069,10 @@ class TrainingManager:
                 
             def load_state_dict(self, state_dict):
                 self.optimizer.load_state_dict(state_dict)
+
+            @property
+            def param_groups(self):
+                return self.optimizer.param_groups
         
         return LookaheadOptimizer(optimizer, k, alpha)
     
