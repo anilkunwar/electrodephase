@@ -309,14 +309,25 @@ class PhysicsOperators:
         
         if not coords.requires_grad:
             coords.requires_grad = True
+        
+        # If retain_graph is not specified, set it to create_graph for consistency
+        if retain_graph is None:
+            retain_graph = create_graph
             
         grad_outputs = torch.ones_like(f, requires_grad=False)
         grads = torch.autograd.grad(
-            f, coords, 
+            outputs=f,
+            inputs=coords,
             grad_outputs=grad_outputs,
             create_graph=create_graph,
-            retain_graph=retain_graph if retain_graph is not None else create_graph
+            retain_graph=retain_graph,
+            allow_unused=True  # Allow unused gradients for flexibility
         )[0]
+        
+        # Handle None gradients
+        if grads is None:
+            grads = torch.zeros_like(coords, requires_grad=create_graph)
+            
         return grads
     
     @staticmethod
@@ -329,23 +340,26 @@ class PhysicsOperators:
         if r is None or f is None:
             raise ValueError("Input tensors cannot be None")
         
+        # Store the original requires_grad state
+        original_requires_grad = r.requires_grad
+        
         if not r.requires_grad:
             r.requires_grad = True
         
         # Compute first derivative
-        f_r = PhysicsOperators.compute_gradient(f, r, create_graph=create_graph)
+        f_r = PhysicsOperators.compute_gradient(f, r, create_graph=create_graph, retain_graph=True)
         
         # Handle r=0 singularity with series expansion (Taylor series)
         near_zero_mask = (r < 1e-8).squeeze()
         if torch.any(near_zero_mask):
             # For points very close to r=0, use series expansion
             # ∇²f ≈ 3f_rr(0) + O(r²) at r=0
-            f_rr = PhysicsOperators.compute_gradient(f_r, r, create_graph=create_graph)
+            f_rr = PhysicsOperators.compute_gradient(f_r, r, create_graph=create_graph, retain_graph=False)
             lap_f_zero = 3 * f_rr[near_zero_mask]
             
             # For other points, use standard formula
             r2_f_r = r[~near_zero_mask]**2 * f_r[~near_zero_mask]
-            r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r[~near_zero_mask], create_graph=create_graph)
+            r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r[~near_zero_mask], create_graph=create_graph, retain_graph=False)
             lap_f = r2_f_r_r / (r[~near_zero_mask]**2 + eps)
             
             # Combine results
@@ -356,8 +370,13 @@ class PhysicsOperators:
         
         # Standard computation away from singularity
         r2_f_r = r**2 * f_r
-        r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r, create_graph=create_graph)
+        r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r, create_graph=create_graph, retain_graph=False)
         lap_f = r2_f_r_r / (r**2 + eps)
+        
+        # Restore original requires_grad state
+        if not original_requires_grad:
+            r.requires_grad = False
+            
         return lap_f
     
     @staticmethod
@@ -368,17 +387,46 @@ class PhysicsOperators:
         if x is None or y is None or f is None:
             raise ValueError("Input tensors cannot be None")
         
-        # Compute gradients once and reuse
+        # Store original requires_grad states
+        x_requires_grad_original = x.requires_grad
+        y_requires_grad_original = y.requires_grad
+        
+        # Ensure gradients are enabled
         x.requires_grad = True
         y.requires_grad = True
         
-        f_x = PhysicsOperators.compute_gradient(f, x, create_graph=create_graph)
-        f_y = PhysicsOperators.compute_gradient(f, y, create_graph=create_graph)
-        
-        f_xx = PhysicsOperators.compute_gradient(f_x, x, create_graph=create_graph)
-        f_yy = PhysicsOperators.compute_gradient(f_y, y, create_graph=create_graph)
-        
-        return f_xx + f_yy
+        try:
+            # Compute gradients for x and y simultaneously to reduce graph operations
+            # First compute gradients
+            f_grads = torch.autograd.grad(
+                outputs=f,
+                inputs=[x, y],
+                grad_outputs=torch.ones_like(f),
+                create_graph=create_graph,
+                retain_graph=True,
+                allow_unused=True
+            )
+            
+            f_x, f_y = f_grads
+            
+            # Handle None gradients
+            if f_x is None:
+                f_x = torch.zeros_like(x, requires_grad=create_graph)
+            if f_y is None:
+                f_y = torch.zeros_like(y, requires_grad=create_graph)
+            
+            # Compute second derivatives
+            f_xx = PhysicsOperators.compute_gradient(f_x, x, create_graph=create_graph, retain_graph=False)
+            f_yy = PhysicsOperators.compute_gradient(f_y, y, create_graph=create_graph, retain_graph=False)
+            
+            return f_xx + f_yy
+            
+        finally:
+            # Restore original requires_grad states
+            if not x_requires_grad_original:
+                x.requires_grad = False
+            if not y_requires_grad_original:
+                y.requires_grad = False
 
 # =====================================================
 # ADAPTIVE SAMPLING AND DOMAIN MANAGEMENT
@@ -420,9 +468,9 @@ class AdaptiveSampler:
                 st.warning(f"Sampling error: {e}. Using random sampling instead.")
                 samples = np.random.random((num_points, 3))
             
-            x = torch.tensor(samples[:, 0] * self.constants.Lx, device=self.device).view(-1, 1)
-            y = torch.tensor(samples[:, 1] * self.constants.Ly, device=self.device).view(-1, 1)
-            t = torch.tensor(samples[:, 2] * self.constants.T_max, device=self.device).view(-1, 1)
+            x = torch.tensor(samples[:, 0] * self.constants.Lx, device=self.device, dtype=torch.float32).view(-1, 1)
+            y = torch.tensor(samples[:, 1] * self.constants.Ly, device=self.device, dtype=torch.float32).view(-1, 1)
+            t = torch.tensor(samples[:, 2] * self.constants.T_max, device=self.device, dtype=torch.float32).view(-1, 1)
             return {'x': x, 'y': y, 't': t}
         
         elif self.geometry == 'spherical_1d':
@@ -435,8 +483,8 @@ class AdaptiveSampler:
                 st.warning(f"Sampling error: {e}. Using random sampling instead.")
                 samples = np.random.random((num_points, 2))
             
-            r = torch.tensor(samples[:, 0] * self.constants.particle_radius, device=self.device).view(-1, 1)
-            t = torch.tensor(samples[:, 1] * self.constants.T_max, device=self.device).view(-1, 1)
+            r = torch.tensor(samples[:, 0] * self.constants.particle_radius, device=self.device, dtype=torch.float32).view(-1, 1)
+            t = torch.tensor(samples[:, 1] * self.constants.T_max, device=self.device, dtype=torch.float32).view(-1, 1)
             return {'r': r, 't': t}
     
     def residual_adaptive_sample(self, model, loss_weights):
@@ -446,25 +494,46 @@ class AdaptiveSampler:
         # Get baseline uniform samples
         samples = self.uniform_sample()
         
-        # REMOVED: torch.no_grad() - we need gradients for residual computation
+        # Use a separate graph for residual computation to avoid interference
+        # We'll create a detached copy of the model for residual computation
+        model_copy = copy.deepcopy(model)
+        model_copy.eval()
+        
+        # Detach model parameters to avoid gradient accumulation
+        for param in model_copy.parameters():
+            param.requires_grad = False
+        
         if self.geometry == 'cartesian_2d':
             x, y, t = samples['x'], samples['y'], samples['t']
-            x.requires_grad_(True)
-            y.requires_grad_(True)
-            t.requires_grad_(True)
             
-            outputs = model(x, y, t)
-            c = outputs['c']
-            mu = outputs['mu']
+            # Enable gradients for coordinates
+            x = x.detach().clone().requires_grad_(True)
+            y = y.detach().clone().requires_grad_(True)
+            t = t.detach().clone().requires_grad_(True)
             
-            # Compute physics residuals
+            # Forward pass with model copy (no gradients for model parameters)
+            with torch.no_grad():
+                outputs = model_copy(x, y, t)
+                c = outputs['c']
+                mu = outputs['mu']
+            
+            # Compute physics residuals with a fresh graph
+            # We need to enable gradients for the outputs
+            c = c.detach().requires_grad_(True)
+            mu = mu.detach().requires_grad_(True)
+            
+            # Compute double well derivative
             df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
+            
+            # Compute Laplacian of c with create_graph=False to avoid building large graph
             lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y, create_graph=False)
             mu_physics = df_dc - self.constants.kappa * lap_c
             mu_residual = torch.abs(mu - mu_physics)
             
             # Time derivative
-            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
+            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False, retain_graph=False)
+            
+            # Laplacian of mu
             mu_lap = PhysicsOperators.compute_laplacian_2d(mu, x, y, create_graph=False)
             evol_residual = torch.abs(c_t - self.constants.M * mu_lap)
             
@@ -473,19 +542,28 @@ class AdaptiveSampler:
                        loss_weights['pde_evol'] * evol_residual)
         else:  # spherical_1d
             r, t = samples['r'], samples['t']
-            r.requires_grad_(True)
-            t.requires_grad_(True)
             
-            outputs = model(r, t)
-            c = outputs['c']
-            mu = outputs['mu']
+            # Enable gradients for coordinates
+            r = r.detach().clone().requires_grad_(True)
+            t = t.detach().clone().requires_grad_(True)
             
+            # Forward pass with model copy
+            with torch.no_grad():
+                outputs = model_copy(r, t)
+                c = outputs['c']
+                mu = outputs['mu']
+            
+            # Enable gradients for outputs
+            c = c.detach().requires_grad_(True)
+            mu = mu.detach().requires_grad_(True)
+            
+            # Compute residuals
             df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
             lap_c = PhysicsOperators.compute_spherical_laplacian(c, r, create_graph=False)
             mu_physics = df_dc - self.constants.kappa * lap_c
             mu_residual = torch.abs(mu - mu_physics)
             
-            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
+            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False, retain_graph=False)
             lap_mu = PhysicsOperators.compute_spherical_laplacian(mu, r, create_graph=False)
             evol_residual = torch.abs(c_t - self.constants.M * lap_mu)
             
@@ -494,6 +572,9 @@ class AdaptiveSampler:
         
         # Detach residuals from computation graph before converting to numpy
         residual = residual.detach()
+        
+        # Clean up to free memory
+        del model_copy
         
         # Create sampling weights based on residuals
         weights = residual.squeeze().cpu().numpy()
@@ -509,15 +590,16 @@ class AdaptiveSampler:
         
         # Create new samples
         if self.geometry == 'cartesian_2d':
+            # Return original samples without gradients for training
             return {
-                'x': x[indices].detach().clone().requires_grad_(True),
-                'y': y[indices].detach().clone().requires_grad_(True),
-                't': t[indices].detach().clone().requires_grad_(True)
+                'x': samples['x'][indices].detach().clone().requires_grad_(True),
+                'y': samples['y'][indices].detach().clone().requires_grad_(True),
+                't': samples['t'][indices].detach().clone().requires_grad_(True)
             }
         else:
             return {
-                'r': r[indices].detach().clone().requires_grad_(True),
-                't': t[indices].detach().clone().requires_grad_(True)
+                'r': samples['r'][indices].detach().clone().requires_grad_(True),
+                't': samples['t'][indices].detach().clone().requires_grad_(True)
             }
     
     def sample_boundary(self, num_points=100):
@@ -528,38 +610,38 @@ class AdaptiveSampler:
             samples = {}
             
             # Left boundary (x=0)
-            y_left = torch.rand(boundary_points, 1, device=self.device) * self.constants.Ly
-            t_left = torch.rand(boundary_points, 1, device=self.device) * self.constants.T_max
+            y_left = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
+            t_left = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             samples['left'] = {
-                'x': torch.zeros(boundary_points, 1, device=self.device),
+                'x': torch.zeros(boundary_points, 1, device=self.device, dtype=torch.float32),
                 'y': y_left,
                 't': t_left
             }
             
             # Right boundary (x=Lx)
-            y_right = torch.rand(boundary_points, 1, device=self.device) * self.constants.Ly
-            t_right = torch.rand(boundary_points, 1, device=self.device) * self.constants.T_max
+            y_right = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
+            t_right = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             samples['right'] = {
-                'x': torch.full((boundary_points, 1), self.constants.Lx, device=self.device),
+                'x': torch.full((boundary_points, 1), self.constants.Lx, device=self.device, dtype=torch.float32),
                 'y': y_right,
                 't': t_right
             }
             
             # Bottom boundary (y=0)
-            x_bottom = torch.rand(boundary_points, 1, device=self.device) * self.constants.Lx
-            t_bottom = torch.rand(boundary_points, 1, device=self.device) * self.constants.T_max
+            x_bottom = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
+            t_bottom = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             samples['bottom'] = {
                 'x': x_bottom,
-                'y': torch.zeros(boundary_points, 1, device=self.device),
+                'y': torch.zeros(boundary_points, 1, device=self.device, dtype=torch.float32),
                 't': t_bottom
             }
             
             # Top boundary (y=Ly)
-            x_top = torch.rand(boundary_points, 1, device=self.device) * self.constants.Lx
-            t_top = torch.rand(boundary_points, 1, device=self.device) * self.constants.T_max
+            x_top = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
+            t_top = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             samples['top'] = {
                 'x': x_top,
-                'y': torch.full((boundary_points, 1), self.constants.Ly, device=self.device),
+                'y': torch.full((boundary_points, 1), self.constants.Ly, device=self.device, dtype=torch.float32),
                 't': t_top
             }
             
@@ -567,15 +649,15 @@ class AdaptiveSampler:
         
         elif self.geometry == 'spherical_1d':
             # Center and surface boundaries
-            t_vals = torch.rand(num_points, 1, device=self.device) * self.constants.T_max
+            t_vals = torch.rand(num_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             
             return {
                 'center': {
-                    'r': torch.zeros(num_points, 1, device=self.device),
+                    'r': torch.zeros(num_points, 1, device=self.device, dtype=torch.float32),
                     't': t_vals
                 },
                 'surface': {
-                    'r': torch.full((num_points, 1), self.constants.particle_radius, device=self.device),
+                    'r': torch.full((num_points, 1), self.constants.particle_radius, device=self.device, dtype=torch.float32),
                     't': t_vals
                 }
             }
@@ -620,6 +702,16 @@ class PhysicsLossCalculator:
         return self._compute_pde_loss_cartesian_2d(model, x, y, t)
     
     def _compute_pde_loss_cartesian_2d(self, model, x, y, t):
+        # Store original states
+        x_requires_grad = x.requires_grad
+        y_requires_grad = y.requires_grad
+        t_requires_grad = t.requires_grad
+        
+        # Ensure gradients are enabled
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        t = t.requires_grad_(True)
+        
         # Get predictions in a single forward pass
         outputs = model(x, y, t)
         c = outputs['c']
@@ -634,7 +726,7 @@ class PhysicsLossCalculator:
         mu_residual = mu_pred - mu_physics
         
         # Time derivative of concentration
-        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True)
+        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True, retain_graph=True)
         
         # Laplacian of chemical potential
         lap_mu = PhysicsOperators.compute_laplacian_2d(mu_pred, x, y, create_graph=True)
@@ -652,6 +744,14 @@ class PhysicsLossCalculator:
             self.loss_weights['interface'] * torch.mean(interface_penalty)
         )
         
+        # Restore original states
+        if not x_requires_grad:
+            x.requires_grad_(False)
+        if not y_requires_grad:
+            y.requires_grad_(False)
+        if not t_requires_grad:
+            t.requires_grad_(False)
+        
         return pde_loss
     
     def compute_pde_loss_spherical_1d(self, model, r, t, use_mixed_precision=False):
@@ -662,6 +762,14 @@ class PhysicsLossCalculator:
         return self._compute_pde_loss_spherical_1d(model, r, t)
     
     def _compute_pde_loss_spherical_1d(self, model, r, t):
+        # Store original states
+        r_requires_grad = r.requires_grad
+        t_requires_grad = t.requires_grad
+        
+        # Ensure gradients are enabled
+        r = r.requires_grad_(True)
+        t = t.requires_grad_(True)
+        
         outputs = model(r, t)
         c = outputs['c']
         mu_pred = outputs['mu']
@@ -675,7 +783,7 @@ class PhysicsLossCalculator:
         mu_residual = mu_pred - mu_physics
         
         # Time derivative
-        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True)
+        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True, retain_graph=True)
         
         # Spherical Laplacian of chemical potential
         lap_mu = PhysicsOperators.compute_spherical_laplacian(mu_pred, r, create_graph=True)
@@ -692,6 +800,12 @@ class PhysicsLossCalculator:
             self.loss_weights['pde_evol'] * torch.mean(evol_residual**2) +
             self.loss_weights['interface'] * torch.mean(interface_penalty)
         )
+        
+        # Restore original states
+        if not r_requires_grad:
+            r.requires_grad_(False)
+        if not t_requires_grad:
+            t.requires_grad_(False)
         
         return pde_loss
     
@@ -712,21 +826,21 @@ class PhysicsLossCalculator:
                 if boundary_samples is None or len(boundary_samples) == 0:
                     continue
                     
-                x = boundary_samples['x'].requires_grad_(True)
-                y = boundary_samples['y'].requires_grad_(True)
-                t = boundary_samples['t'].requires_grad_(True)
+                x = boundary_samples['x'].detach().clone().requires_grad_(True)
+                y = boundary_samples['y'].detach().clone().requires_grad_(True)
+                t = boundary_samples['t'].detach().clone().requires_grad_(True)
                 
                 outputs = model(x, y, t)
                 c = outputs['c']
                 mu = outputs['mu']
                 
                 if boundary_name in ['left', 'right']:  # x boundaries
-                    c_x = PhysicsOperators.compute_gradient(c, x, create_graph=True)
-                    mu_x = PhysicsOperators.compute_gradient(mu, x, create_graph=True)
+                    c_x = PhysicsOperators.compute_gradient(c, x, create_graph=True, retain_graph=True)
+                    mu_x = PhysicsOperators.compute_gradient(mu, x, create_graph=True, retain_graph=False)
                     bc_loss = torch.mean(c_x**2 + mu_x**2)
                 else:  # y boundaries
-                    c_y = PhysicsOperators.compute_gradient(c, y, create_graph=True)
-                    mu_y = PhysicsOperators.compute_gradient(mu, y, create_graph=True)
+                    c_y = PhysicsOperators.compute_gradient(c, y, create_graph=True, retain_graph=True)
+                    mu_y = PhysicsOperators.compute_gradient(mu, y, create_graph=True, retain_graph=False)
                     bc_loss = torch.mean(c_y**2 + mu_y**2)
                 
                 total_bc_loss += bc_loss
@@ -735,8 +849,8 @@ class PhysicsLossCalculator:
         elif self.geometry == 'spherical_1d':
             # Center boundary (r=0): symmetry condition
             if 'center' in samples and samples['center'] is not None:
-                r_center = samples['center']['r'].requires_grad_(True)
-                t_center = samples['center']['t'].requires_grad_(True)
+                r_center = samples['center']['r'].detach().clone().requires_grad_(True)
+                t_center = samples['center']['t'].detach().clone().requires_grad_(True)
                 
                 outputs_center = model(r_center, t_center)
                 c_center = outputs_center['c']
@@ -754,8 +868,8 @@ class PhysicsLossCalculator:
             
             # Surface boundary (r=R): Butler-Volmer kinetics if voltage is included
             if model.include_voltage and 'surface' in samples and samples['surface'] is not None:
-                r_surface = samples['surface']['r'].requires_grad_(True)
-                t_surface = samples['surface']['t'].requires_grad_(True)
+                r_surface = samples['surface']['r'].detach().clone().requires_grad_(True)
+                t_surface = samples['surface']['t'].detach().clone().requires_grad_(True)
                 
                 outputs_surface = model(r_surface, t_surface)
                 c_surface = outputs_surface['c']
@@ -776,7 +890,7 @@ class PhysicsLossCalculator:
                 )
                 
                 # Compute actual flux from model (M * ∂μ/∂r at surface)
-                mu_r_surface = PhysicsOperators.compute_gradient(mu_surface, r_surface, create_graph=True)
+                mu_r_surface = PhysicsOperators.compute_gradient(mu_surface, r_surface, create_graph=True, retain_graph=False)
                 actual_flux = self.constants.M * mu_r_surface
                 
                 # Flux matching loss
@@ -795,13 +909,9 @@ class PhysicsLossCalculator:
     
     def _compute_initial_condition_loss(self, model):
         if self.geometry == 'cartesian_2d':
-            x = torch.rand(500, 1, device=self.device) * self.constants.Lx
-            y = torch.rand(500, 1, device=self.device) * self.constants.Ly
-            t = torch.zeros(500, 1, device=self.device)
-            
-            x.requires_grad = True
-            y.requires_grad = True
-            t.requires_grad = True
+            x = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
+            y = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
+            t = torch.zeros(500, 1, device=self.device, dtype=torch.float32)
             
             outputs = model(x, y, t)
             c_pred = outputs['c']
@@ -813,11 +923,8 @@ class PhysicsLossCalculator:
             return ic_loss
         
         elif self.geometry == 'spherical_1d':
-            r = torch.rand(500, 1, device=self.device) * self.constants.particle_radius
-            t = torch.zeros(500, 1, device=self.device)
-            
-            r.requires_grad = True
-            t.requires_grad = True
+            r = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.particle_radius
+            t = torch.zeros(500, 1, device=self.device, dtype=torch.float32)
             
             outputs = model(r, t)
             c_pred = outputs['c']
@@ -843,9 +950,9 @@ class PhysicsLossCalculator:
     
     def _compute_voltage_constraint_loss(self, model):
         if self.geometry == 'cartesian_2d':
-            x = torch.rand(200, 1, device=self.device) * self.constants.Lx
-            y = torch.rand(200, 1, device=self.device) * self.constants.Ly
-            t = torch.rand(200, 1, device=self.device) * self.constants.T_max
+            x = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
+            y = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
+            t = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
             
             x.requires_grad = True
             y.requires_grad = True
@@ -896,8 +1003,8 @@ class PhysicsLossCalculator:
                 if self.geometry == 'cartesian_2d':
                     # Sample multiple spatial points for better averaging
                     num_spatial = 5
-                    x = torch.linspace(0, self.constants.Lx, num_spatial, device=self.device)
-                    y = torch.linspace(0, self.constants.Ly, num_spatial, device=self.device)
+                    x = torch.linspace(0, self.constants.Lx, num_spatial, device=self.device, dtype=torch.float32)
+                    y = torch.linspace(0, self.constants.Ly, num_spatial, device=self.device, dtype=torch.float32)
                     X, Y = torch.meshgrid(x, y, indexing='ij')
                     
                     total_V_pred = 0
@@ -1094,7 +1201,9 @@ class TrainingManager:
         # Training loop
         for epoch in range(epochs):
             epoch_start = time.time()
-            self.optimizer.zero_grad()
+            
+            # Zero gradients at the start of each epoch
+            self.optimizer.zero_grad(set_to_none=True)  # Use set_to_none for better memory management
             
             # Update adaptive weights
             self.loss_calculator.update_loss_weights(epoch, epochs)
@@ -1155,13 +1264,13 @@ class TrainingManager:
             
             # Backward pass with mixed precision if available
             if use_mixed_precision and self.loss_calculator.scaler is not None:
-                self.loss_calculator.scaler.scale(total_loss).backward()
+                self.loss_calculator.scaler.scale(total_loss).backward(retain_graph=False)
                 self.loss_calculator.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.loss_calculator.scaler.step(self.optimizer)
                 self.loss_calculator.scaler.update()
             else:
-                total_loss.backward()
+                total_loss.backward(retain_graph=False)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             
@@ -1356,14 +1465,14 @@ def plot_loss_history_optimized(history):
 def plot_concentration_profile_2d_optimized(model, constants, t_value, resolution=100):
     """Optimized 2D concentration profile plotting"""
     # Create grid with proper resolution
-    x = torch.linspace(0, constants.Lx, resolution, device=constants.device)
-    y = torch.linspace(0, constants.Ly, resolution, device=constants.device)
+    x = torch.linspace(0, constants.Lx, resolution, device=constants.device, dtype=torch.float32)
+    y = torch.linspace(0, constants.Ly, resolution, device=constants.device, dtype=torch.float32)
     X, Y = torch.meshgrid(x, y, indexing='ij')
     
     # Batch prediction for memory efficiency
     batch_size = 10000
     total_points = resolution * resolution
-    c_pred_all = torch.zeros(total_points, device=constants.device)
+    c_pred_all = torch.zeros(total_points, device=constants.device, dtype=torch.float32)
     
     with torch.no_grad():
         for i in range(0, total_points, batch_size):
@@ -1426,7 +1535,7 @@ def plot_spherical_profile_optimized(model, constants, t_values):
     if len(t_values) == 1:
         axes = [axes]
     
-    r = torch.linspace(0, constants.particle_radius, 200, device=constants.device).reshape(-1, 1)
+    r = torch.linspace(0, constants.particle_radius, 200, device=constants.device, dtype=torch.float32).reshape(-1, 1)
     
     # Precompute theoretical interface position for comparison
     interface_position = 0.5 * constants.particle_radius  # Simplified estimate
@@ -1478,7 +1587,7 @@ def plot_spherical_profile_optimized(model, constants, t_values):
 
 def plot_voltage_profile_optimized(model, constants, geometry='cartesian_2d'):
     """Optimized voltage profile plotting"""
-    t_values = torch.linspace(0, constants.T_max, 200, device=constants.device).reshape(-1, 1)
+    t_values = torch.linspace(0, constants.T_max, 200, device=constants.device, dtype=torch.float32).reshape(-1, 1)
     
     V_pred = np.zeros(len(t_values))
     V_eq = np.zeros(len(t_values))
@@ -1492,8 +1601,8 @@ def plot_voltage_profile_optimized(model, constants, geometry='cartesian_2d'):
             
             if geometry == 'cartesian_2d':
                 # Sample multiple points for spatial averaging
-                x_samples = torch.linspace(0, constants.Lx, 5, device=constants.device)
-                y_samples = torch.linspace(0, constants.Ly, 5, device=constants.device)
+                x_samples = torch.linspace(0, constants.Lx, 5, device=constants.device, dtype=torch.float32)
+                y_samples = torch.linspace(0, constants.Ly, 5, device=constants.device, dtype=torch.float32)
                 X, Y = torch.meshgrid(x_samples, y_samples, indexing='ij')
                 
                 V_batch_total = 0
@@ -1516,7 +1625,7 @@ def plot_voltage_profile_optimized(model, constants, geometry='cartesian_2d'):
                 V_eq[i:end_idx] = (constants.V0 - (1/constants.F) * (mu_batch_total / count)).cpu().numpy()
             
             else:  # spherical_1d
-                r_batch = torch.full((len(t_batch), 1), constants.particle_radius, device=constants.device)
+                r_batch = torch.full((len(t_batch), 1), constants.particle_radius, device=constants.device, dtype=torch.float32)
                 outputs = model(r_batch, t_batch)
                 
                 if 'V' in outputs:
@@ -1872,7 +1981,7 @@ def main_optimized():
                             with st.spinner(f"Rendering t={t_val:.0f}s..."):
                                 try:
                                     fig_small, ax = plt.subplots(figsize=(4, 3), dpi=100)
-                                    x = torch.linspace(0, constants.Lx, 100, device=device).reshape(-1, 1)
+                                    x = torch.linspace(0, constants.Lx, 100, device=device, dtype=torch.float32).reshape(-1, 1)
                                     y = torch.full_like(x, constants.Ly/2)
                                     t = torch.full_like(x, t_val)
                                     
@@ -1925,14 +2034,14 @@ def main_optimized():
                 try:
                     t_values = np.linspace(0, constants.T_max, 200)
                     if geometry == "cartesian_2d":
-                        x = torch.ones((200, 1), device=device) * constants.Lx / 2
-                        y = torch.ones((200, 1), device=device) * constants.Ly / 2
+                        x = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.Lx / 2
+                        y = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.Ly / 2
                         t = torch.tensor(t_values, dtype=torch.float32, device=device).reshape(-1, 1)
                         with torch.no_grad():
                             outputs = model(x, y, t)
                             V_pred = outputs['V'].cpu().detach().numpy().flatten() if 'V' in outputs else np.zeros_like(t_values)
                     else:
-                        r = torch.ones((200, 1), device=device) * constants.particle_radius
+                        r = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.particle_radius
                         t = torch.tensor(t_values, dtype=torch.float32, device=device).reshape(-1, 1)
                         with torch.no_grad():
                             outputs = model(r, t)
@@ -1969,11 +2078,11 @@ def main_optimized():
                     with st.spinner("Checking mass conservation..."):
                         try:
                             t_test = torch.tensor([0.0, constants.T_max/2, constants.T_max], 
-                                                device=device).reshape(-1, 1)
+                                                device=device, dtype=torch.float32).reshape(-1, 1)
                             total_mass = []
                             for t_val in t_test:
-                                x = torch.rand(1000, 1, device=device) * constants.Lx
-                                y = torch.rand(1000, 1, device=device) * constants.Ly
+                                x = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Lx
+                                y = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Ly
                                 t_full = torch.full_like(x, t_val.item(), device=device)
                                 with torch.no_grad():
                                     outputs = model(x, y, t_full)
@@ -2000,9 +2109,9 @@ def main_optimized():
                 if geometry == "cartesian_2d":
                     with st.spinner("Computing phase fractions..."):
                         try:
-                            x = torch.rand(1000, 1, device=device) * constants.Lx
-                            y = torch.rand(1000, 1, device=device) * constants.Ly
-                            t = torch.full_like(x, constants.T_max, device=device)
+                            x = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Lx
+                            y = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Ly
+                            t = torch.full_like(x, constants.T_max, device=device, dtype=torch.float32)
                             with torch.no_grad():
                                 outputs = model(x, y, t)
                                 c = outputs['c'].cpu().detach().numpy()
@@ -2014,9 +2123,9 @@ def main_optimized():
                             st.metric("LiFePO₄ Fraction", f"{phase_LiFePO4:.3f}")
                             
                             # Interface width estimation
-                            x_line = torch.linspace(0, constants.Lx, 200, device=device).reshape(-1, 1)
+                            x_line = torch.linspace(0, constants.Lx, 200, device=device, dtype=torch.float32).reshape(-1, 1)
                             y_line = torch.full_like(x_line, constants.Ly/2)
-                            t_line = torch.full_like(x_line, constants.T_max, device=device)
+                            t_line = torch.full_like(x_line, constants.T_max, device=device, dtype=torch.float32)
                             
                             with torch.enable_grad():
                                 x_line.requires_grad = True
