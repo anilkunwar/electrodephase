@@ -463,7 +463,7 @@ def train_pinn_model(params: Dict,
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=500, verbose=False
+        optimizer, mode='min', factor=0.5, patience=500 #, verbose=False
     )
     
     # Loss history tracking
