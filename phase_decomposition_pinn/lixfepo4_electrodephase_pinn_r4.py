@@ -1113,7 +1113,7 @@ class TrainingManager:
         self.use_mixed_precision = (self.device == 'cuda' and hasattr(torch.cuda, 'amp'))
         
         # Base optimizer with weight decay
-        self.optimizer = optim.AdamW(
+        base_optimizer = optim.AdamW(
             self.model.parameters(), 
             lr=lr, 
             weight_decay=weight_decay,
@@ -1122,7 +1122,7 @@ class TrainingManager:
         
         # Learning rate scheduler with warmup
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
+            base_optimizer, 
             mode='min', 
             factor=0.5, 
             patience=100
@@ -1130,56 +1130,9 @@ class TrainingManager:
         
         # Optional lookahead optimizer
         if use_lookahead:
-            self.optimizer = self._wrap_with_lookahead(self.optimizer)
-    
-    def _wrap_with_lookahead(self, optimizer, k=5, alpha=0.5):
-        """Wrap optimizer with lookahead for better convergence"""
-        class LookaheadOptimizer:
-            def __init__(self, optimizer, k=5, alpha=0.5):
-                self.optimizer = optimizer
-                self.k = k
-                self.alpha = alpha
-                self.step_counter = 0
-                
-                # Save fast weights
-                self.param_groups_backup = []
-                for group in optimizer.param_groups:
-                    group_backup = {}
-                    for p in group['params']:
-                        if p.requires_grad:
-                            group_backup[p] = p.data.clone().detach()
-                    self.param_groups_backup.append(group_backup)
-            
-            def step(self):
-                self.optimizer.step()
-                self.step_counter += 1
-                
-                # Update slow weights periodically
-                if self.step_counter >= self.k:
-                    for group_idx, group in enumerate(self.optimizer.param_groups):
-                        backup = self.param_groups_backup[group_idx]
-                        for p in group['params']:
-                            if p.requires_grad and p in backup:
-                                # Slow update: θ = θ + α(φ - θ)
-                                backup[p].add_(self.alpha * (p.data - backup[p]))
-                                # Copy back to fast weights
-                                p.data.copy_(backup[p])
-                        self.step_counter = 0
-            
-            def zero_grad(self):
-                self.optimizer.zero_grad()
-                
-            def state_dict(self):
-                return self.optimizer.state_dict()
-                
-            def load_state_dict(self, state_dict):
-                self.optimizer.load_state_dict(state_dict)
-
-            @property
-            def param_groups(self):
-                return self.optimizer.param_groups
-        
-        return LookaheadOptimizer(optimizer, k, alpha)
+            self.optimizer = LookaheadOptimizer(base_optimizer)
+        else:
+            self.optimizer = base_optimizer
     
     def train(self, epochs=5000, batch_size=None, use_mixed_precision=None):
         """Advanced training loop with optimizations"""
@@ -1203,7 +1156,11 @@ class TrainingManager:
             epoch_start = time.time()
             
             # Zero gradients at the start of each epoch
-            self.optimizer.zero_grad(set_to_none=True)  # Use set_to_none for better memory management
+            # Handle set_to_none parameter appropriately for different optimizer types
+            if hasattr(self.optimizer, 'set_to_none'):
+                self.optimizer.zero_grad(set_to_none=True)
+            else:
+                self.optimizer.zero_grad()
             
             # Update adaptive weights
             self.loss_calculator.update_loss_weights(epoch, epochs)
@@ -1256,10 +1213,10 @@ class TrainingManager:
             # Total loss with adaptive weights
             total_loss = (
                 1.0 * pde_loss +
-                self.loss_calculator.loss_weights['bc'] * bc_loss +
-                self.loss_calculator.loss_weights['ic'] * ic_loss +
-                self.loss_calculator.loss_weights['voltage'] * voltage_loss +
-                self.loss_calculator.loss_weights['data'] * data_loss
+                self.loss_weights['bc'] * bc_loss +
+                self.loss_weights['ic'] * ic_loss +
+                self.loss_weights['voltage'] * voltage_loss +
+                self.loss_weights['data'] * data_loss
             )
             
             # Backward pass with mixed precision if available
@@ -1357,6 +1314,67 @@ class TrainingManager:
         self.history = checkpoint['history']
         
         return self.model, self.history
+
+# =====================================================
+# LOOKAHEAD OPTIMIZER IMPLEMENTATION
+# =====================================================
+class LookaheadOptimizer:
+    """Lookahead optimizer implementation for better convergence"""
+    def __init__(self, base_optimizer, k=5, alpha=0.5):
+        self.base_optimizer = base_optimizer
+        self.k = k
+        self.alpha = alpha
+        self.step_counter = 0
+        
+        # Save fast weights
+        self.param_groups_backup = []
+        for group in base_optimizer.param_groups:
+            group_backup = {}
+            for p in group['params']:
+                if p.requires_grad:
+                    group_backup[p] = p.data.clone().detach()
+            self.param_groups_backup.append(group_backup)
+        
+        # Copy param_groups from base optimizer
+        self.param_groups = base_optimizer.param_groups
+    
+    def step(self):
+        """Perform optimization step"""
+        self.base_optimizer.step()
+        self.step_counter += 1
+        
+        # Update slow weights periodically
+        if self.step_counter >= self.k:
+            for group_idx, group in enumerate(self.base_optimizer.param_groups):
+                backup = self.param_groups_backup[group_idx]
+                for p in group['params']:
+                    if p.requires_grad and p in backup:
+                        # Slow update: θ = θ + α(φ - θ)
+                        backup[p].add_(self.alpha * (p.data - backup[p]))
+                        # Copy back to fast weights
+                        p.data.copy_(backup[p])
+            self.step_counter = 0
+    
+    def zero_grad(self, set_to_none=None):
+        """Zero the gradients of optimized parameters"""
+        # Pass set_to_none parameter if base optimizer supports it
+        if set_to_none is not None:
+            # Try to call with set_to_none if supported
+            try:
+                self.base_optimizer.zero_grad(set_to_none=set_to_none)
+            except TypeError:
+                # Fall back to regular zero_grad if set_to_none not supported
+                self.base_optimizer.zero_grad()
+        else:
+            self.base_optimizer.zero_grad()
+    
+    def state_dict(self):
+        """Get optimizer state dictionary"""
+        return self.base_optimizer.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        """Load optimizer state dictionary"""
+        self.base_optimizer.load_state_dict(state_dict)
 
 # =====================================================
 # OPTIMIZED TRAINING FUNCTION
