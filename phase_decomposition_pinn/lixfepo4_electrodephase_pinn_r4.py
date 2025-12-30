@@ -1,2362 +1,2219 @@
+"""
+COMPREHENSIVE PINN SOLUTION FOR CU-NI CROSS-DIFFUSION PROBLEM
+================================================================
+Physics-Informed Neural Network for solving coupled cross-diffusion equations
+with boundary conditions and time evolution.
+
+Governing Equations:
+∂c₁/∂t = D₁₁∇²c₁ + D₁₂∇²c₂  (Cu concentration)
+∂c₂/∂t = D₂₁∇²c₁ + D₂₂∇²c₂  (Ni concentration)
+
+Domain: x ∈ [0, Lx], y ∈ [0, Ly], t ∈ [0, T_max]
+Boundary Conditions:
+  Top (y=Ly): Cu-rich, Ni-poor
+  Bottom (y=0): Cu-poor, Ni-rich
+  Sides: Zero flux (∂c/∂x = 0)
+Initial Condition: c₁ = c₂ = 0 at t=0
+"""
+
+# ============================================================================
+# 1. IMPORTS AND CONFIGURATION
+# ============================================================================
 import streamlit as st
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
-import pandas as pd
-import io
-import time
-from datetime import datetime
-import json
+import pickle
 import os
-from torch.cuda.amp import autocast, GradScaler
-from functools import lru_cache
-import threading
-import queue
-import copy
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.colors import LogNorm
+import matplotlib.gridspec as gridspec
+import zipfile
+import io
+import matplotlib as mpl
+import logging
+import pyvista as pv
+from pyvista import examples
+import hashlib
+import time
+import json
+from datetime import datetime
+from scipy import integrate
+from scipy.stats import linregress
 import warnings
-from scipy.stats import qmc
+warnings.filterwarnings('ignore')
 
-torch.backends.cudnn.benchmark = True
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+# Create output directory with timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = f'/tmp/pinn_solutions_{timestamp}'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# =====================================================
-# OPTIMIZED PHYSICAL CONSTANTS FOR LiFePO₄
-# =====================================================
-class PhysicalConstants:
-    """Optimized physical constants for LiFePO₄ system with unit conversions"""
-    __slots__ = ('R', 'F', 'T', 'V_m', 'c_alpha', 'c_beta', 'c_avg', 
-                 'Ω', 'W', 'kappa', 'M', 'V0', 'i0', 'alpha', 
-                 'particle_radius', 'Lx', 'Ly', 'T_max', 
-                 'interface_width_expected', 'device')
+# Enhanced Matplotlib configuration
+mpl.rcParams['font.family'] = 'Arial'
+mpl.rcParams['font.size'] = 12
+mpl.rcParams['axes.linewidth'] = 2.0
+mpl.rcParams['xtick.major.width'] = 1.5
+mpl.rcParams['ytick.major.width'] = 1.5
+mpl.rcParams['xtick.major.size'] = 8
+mpl.rcParams['ytick.major.size'] = 8
+mpl.rcParams['figure.dpi'] = 300
+mpl.rcParams['savefig.dpi'] = 300
+mpl.rcParams['legend.fontsize'] = 11
+mpl.rcParams['axes.grid'] = True
+mpl.rcParams['grid.alpha'] = 0.3
+mpl.rcParams['grid.linestyle'] = '--'
+
+# Enhanced logging configuration
+log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    handlers=[
+        logging.FileHandler(os.path.join(OUTPUT_DIR, 'training.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 2. PHYSICAL PARAMETERS AND CONSTANTS
+# ============================================================================
+class PhysicalParameters:
+    """Container for all physical parameters with validation"""
     
-    def __init__(self, device='cpu'):
-        # Validate and sanitize device input
-        if device is None:
-            device = 'cpu'
-        
-        # Convert string device names to appropriate format
-        if isinstance(device, str):
-            if device.lower() in ['cpu', 'cuda']:
-                device = device.lower()
-            elif 'cuda' in device.lower():
-                device = 'cuda'
-            else:
-                device = 'cpu'
-        
-        self.device = device
-        # Fundamental constants
-        self.R = 8.314462618   # J/(mol·K)
-        self.F = 96485.33212   # C/mol
-        
-        # LiFePO₄ specific parameters
-        self.T = 298.15        # K
-        self.V_m = 3.0e-5      # m³/mol (molar volume)
-        
-        # Phase compositions (dimensionless)
-        self.c_alpha = 0.03    # FePO₄-rich phase (x in LiₓFePO₄)
-        self.c_beta = 0.97     # LiFePO₄-rich phase
-        self.c_avg = 0.5       # Average composition
-        
-        # Material properties - precomputed for efficiency
-        self.Ω = 55e3          # J/mol (regular solution parameter)
-        self.W = self.Ω / self.V_m  # J/m³ (double-well height)
-        
-        # Interface physics - optimized for 1nm interface width
-        self.interface_width_expected = 1e-9  # 1 nm
-        self.kappa = 2.0 * self.W * (self.interface_width_expected)**2  # J/m
-        
-        # Mobility with physical scaling
-        self.M = 1e-18 / (self.W * (self.interface_width_expected)**3)  # m⁵/(J·s)
-        
-        # Reference voltage
-        self.V0 = 3.42         # V vs Li/Li⁺
-        
-        # Electrochemical kinetics
-        self.i0 = 1e-3         # A/m² (exchange current density)
-        self.alpha = 0.5       # Charge transfer coefficient
-        
-        # Geometry defaults (can be modified)
-        self.particle_radius = 50e-9    # 50 nm
-        self.Lx = 100e-9       # 100 nm
-        self.Ly = 100e-9       # 100 nm
-        self.T_max = 3600.0    # 1 hour simulation
-        
-        # Validate CUDA availability
-        if self.device == 'cuda' and not torch.cuda.is_available():
-            st.warning("CUDA requested but not available. Falling back to CPU.")
-            self.device = 'cpu'
+    # Diffusion coefficients (μm²/s) - Cu-Ni system at 260°C
+    D11 = 0.00600      # Cu self-diffusion coefficient
+    D12 = 0.00427      # Cu-Ni cross-diffusion coefficient
+    D21 = 0.003697     # Ni-Cu cross-diffusion coefficient  
+    D22 = 0.00540      # Ni self-diffusion coefficient
     
-    def to(self, device):
-        """Move all tensor constants to specified device with validation"""
-        if device is None:
-            device = 'cpu'
-        
-        if isinstance(device, str):
-            if device.lower() == 'cuda' and not torch.cuda.is_available():
-                st.warning("CUDA requested but not available. Falling back to CPU.")
-                device = 'cpu'
-            elif device.lower() not in ['cpu', 'cuda']:
-                device = 'cpu'
-        
-        self.device = device
-        return self
+    # Domain dimensions (μm)
+    Lx = 60.0          # Width
+    Ly = 50.0          # Height
     
-    def get_dimensionless_params(self):
-        """Return dimensionless parameters for scaling analysis"""
+    # Time parameters (s)
+    T_max = 200.0      # Maximum simulation time
+    
+    # Boundary concentrations (mol/μm³)
+    C_CU_TOP = 1.59e-03    # Top boundary: Cu-rich
+    C_CU_BOTTOM = 0.0      # Bottom boundary: Cu-poor
+    C_NI_TOP = 0.0         # Top boundary: Ni-poor
+    C_NI_BOTTOM = 4.0e-04  # Bottom boundary: Ni-rich
+    
+    # Material properties
+    temperature = 533.15    # Kelvin (260°C)
+    molar_volume = 7.11e-6  # μm³/mol (approx for Cu-Ni alloy)
+    
+    @classmethod
+    def validate(cls):
+        """Validate physical parameters"""
+        assert cls.D11 > 0 and cls.D22 > 0, "Diffusion coefficients must be positive"
+        assert cls.Lx > 0 and cls.Ly > 0, "Domain dimensions must be positive"
+        assert cls.T_max > 0, "Maximum time must be positive"
+        assert cls.C_CU_TOP >= 0 and cls.C_NI_BOTTOM >= 0, "Concentrations must be non-negative"
+        logger.info("Physical parameters validated successfully")
+        
+    @classmethod
+    def get_dict(cls):
+        """Return parameters as dictionary"""
         return {
-            'interface_width_nd': self.interface_width_expected / self.particle_radius,
-            'mobility_nd': self.M * self.W * self.T_max / (self.particle_radius**2),
-            'voltage_scale': 1.0  # Reference scale for voltage
+            'D11': cls.D11, 'D12': cls.D12, 'D21': cls.D21, 'D22': cls.D22,
+            'Lx': cls.Lx, 'Ly': cls.Ly, 'T_max': cls.T_max,
+            'C_CU_TOP': cls.C_CU_TOP, 'C_CU_BOTTOM': cls.C_CU_BOTTOM,
+            'C_NI_TOP': cls.C_NI_TOP, 'C_NI_BOTTOM': cls.C_NI_BOTTOM,
+            'temperature': cls.temperature, 'molar_volume': cls.molar_volume
         }
 
-# =====================================================
-# OPTIMIZED PINN MODEL ARCHITECTURE
-# =====================================================
+# Validate parameters
+PhysicalParameters.validate()
+
+# ============================================================================
+# 3. NEURAL NETWORK ARCHITECTURES
+# ============================================================================
+
 class FourierFeatureMapping(nn.Module):
-    """Fourier feature mapping for improved spatial frequency representation"""
-    def __init__(self, in_dim, num_frequencies=20, scale=10.0):
+    """Fourier feature mapping for better representation of high-frequency features"""
+    def __init__(self, input_dim, mapping_size=256, sigma=10.0):
         super().__init__()
-        self.in_dim = in_dim
-        self.num_frequencies = num_frequencies
-        self.scale = scale
-        
-        # Create frequency matrix
-        self.register_buffer('B', torch.randn(in_dim, num_frequencies) * scale)
+        self.B = nn.Parameter(torch.randn(input_dim, mapping_size // 2) * sigma)
         
     def forward(self, x):
-        """Apply Fourier features to input coordinates"""
-        x = x.to(self.B.dtype)
-        proj = 2 * torch.pi * (x @ self.B)
-        return torch.cat([x, torch.sin(proj), torch.cos(proj)], dim=-1)
+        x_proj = 2 * torch.pi * x @ self.B
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class AdaptiveActivation(nn.Module):
+    """Adaptive activation function with learnable slope"""
+    def __init__(self, slope=1.0):
+        super().__init__()
+        self.a = nn.Parameter(torch.tensor(slope))
+        
+    def forward(self, x):
+        return torch.tanh(self.a * x)
 
 class ResidualBlock(nn.Module):
-    """Residual block with layer normalization for stable training"""
-    def __init__(self, hidden_dim):
+    """Residual block with skip connection"""
+    def __init__(self, hidden_dim, dropout_rate=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Tanh()
-        )
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = AdaptiveActivation()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         
     def forward(self, x):
-        return x + self.net(x)
+        residual = x
+        out = self.activation(self.linear1(x))
+        out = self.dropout(out)
+        out = self.linear2(out)
+        out = self.layer_norm(out + residual)
+        return self.activation(out)
 
-class AdaptivePINN(nn.Module):
+class EnhancedPINN(nn.Module):
     """
-    Optimized Physics-Informed Neural Network with adaptive architecture
-    Features:
-    - Fourier feature mapping for improved spatial representation
-    - Residual connections for stable deep training
-    - Layer normalization for faster convergence
-    - Output scaling with physical constraints
-    - Mixed precision support
+    Enhanced Physics-Informed Neural Network with:
+    - Fourier feature mapping
+    - Residual connections
+    - Adaptive activations
+    - Multiple output heads with boundary condition encoding
     """
-    def __init__(self, constants, geometry='cartesian_2d', include_voltage=True, 
-                 hidden_dim=128, num_layers=4, use_fourier_features=True):
+    
+    def __init__(self, params, hidden_layers=8, hidden_dim=256, 
+                 fourier_features=True, dropout_rate=0.05):
         super().__init__()
-        self.constants = constants
-        self.geometry = geometry
-        self.include_voltage = include_voltage
-        self.use_fourier_features = use_fourier_features
-        self.device = constants.device
         
-        # Determine input dimension based on geometry
-        if geometry == 'cartesian_2d':
-            input_dim = 3  # (x, y, t)
-        elif geometry in ['cartesian_1d', 'spherical_1d']:
-            input_dim = 2  # (x, t) or (r, t)
+        self.params = params
+        self.fourier_features = fourier_features
+        
+        # Input normalization
+        self.x_mean = params['Lx'] / 2
+        self.x_std = params['Lx'] / 2
+        self.y_mean = params['Ly'] / 2
+        self.y_std = params['Ly'] / 2
+        self.t_mean = params['T_max'] / 2
+        self.t_std = params['T_max'] / 2
+        
+        # Input processing
+        if fourier_features:
+            self.fourier_map = FourierFeatureMapping(5, mapping_size=128)
+            input_dim = 128 + 5  # Fourier features + original features
         else:
-            raise ValueError(f"Unknown geometry: {geometry}")
+            input_dim = 5
         
-        # Fourier feature mapping for better spatial representation
-        if use_fourier_features:
-            self.fourier_mapping = FourierFeatureMapping(input_dim, num_frequencies=15, scale=5.0)
-            mapped_dim = input_dim + 2 * 15
-        else:
-            self.fourier_mapping = nn.Identity()
-            mapped_dim = input_dim
+        # Main network with residual blocks
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(AdaptiveActivation())
+        layers.append(nn.Dropout(dropout_rate))
         
-        # Build network with residual connections
-        layers = [
-            nn.Linear(mapped_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Tanh()
-        ]
-        
-        # Add residual blocks
-        for _ in range(num_layers - 1):
-            layers.append(ResidualBlock(hidden_dim))
-        
+        for _ in range(hidden_layers - 1):
+            layers.append(ResidualBlock(hidden_dim, dropout_rate))
+            
         self.shared_net = nn.Sequential(*layers)
         
-        # Output heads with physical constraints
-        self.concentration_head = nn.Sequential(
+        # Output heads with boundary condition enforcement
+        self.cu_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
+            AdaptiveActivation(),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()  # Ensures output in [0,1]
+            nn.Softplus()  # Ensure non-negative concentration
         )
         
-        self.chemical_potential_head = nn.Sequential(
+        self.ni_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1)
+            AdaptiveActivation(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()
         )
         
-        if self.include_voltage:
-            self.voltage_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.Tanh(),
-                nn.Linear(hidden_dim // 2, 1)
-            )
+        # Boundary condition encoding parameters
+        self.register_buffer('top_bc_cu', torch.tensor(params['C_CU_TOP']))
+        self.register_buffer('top_bc_ni', torch.tensor(params['C_NI_TOP']))
+        self.register_buffer('bottom_bc_cu', torch.tensor(params['C_CU_BOTTOM']))
+        self.register_buffer('bottom_bc_ni', torch.tensor(params['C_NI_BOTTOM']))
         
-        # Physical scaling parameters
-        self.register_buffer('c_scale', torch.tensor(constants.c_beta - constants.c_alpha))
-        self.register_buffer('c_offset', torch.tensor(constants.c_alpha))
-        self.register_buffer('V_scale', torch.tensor(0.1))  # Typical voltage range scale
+        # Initialize weights
+        self._initialize_weights()
         
-    def forward(self, *inputs):
-        """Optimized forward pass with physical constraints"""
-        # Validate inputs
-        if len(inputs) == 0:
-            raise ValueError("No inputs provided to forward pass")
+    def _initialize_weights(self):
+        """Xavier initialization for better convergence"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                    
+    def _normalize_inputs(self, x, y, t):
+        """Normalize inputs to [-1, 1] range"""
+        x_norm = (x - self.x_mean) / self.x_std
+        y_norm = (y - self.y_mean) / self.y_std
+        t_norm = (t - self.t_mean) / self.t_std
+        return x_norm, y_norm, t_norm
         
-        # Combine inputs and move to device
-        if self.geometry == 'cartesian_2d':
-            if len(inputs) != 3:
-                raise ValueError(f"Expected 3 inputs for cartesian_2d, got {len(inputs)}")
-            x, y, t = inputs
-            inputs_tensor = torch.cat([x, y, t], dim=1)
+    def forward(self, x, y, t):
+        """
+        Forward pass with boundary condition encoding
+        Returns: [c_cu, c_ni]
+        """
+        # Normalize inputs
+        x_norm, y_norm, t_norm = self._normalize_inputs(x, y, t)
+        
+        # Create base features
+        base_features = torch.cat([x_norm, y_norm, t_norm, 
+                                 torch.ones_like(x_norm), 
+                                 torch.ones_like(x_norm)], dim=1)
+        
+        # Apply Fourier feature mapping if enabled
+        if self.fourier_features:
+            ff_features = self.fourier_map(base_features)
+            features = torch.cat([base_features, ff_features], dim=1)
         else:
-            if len(inputs) != 2:
-                raise ValueError(f"Expected 2 inputs for {self.geometry}, got {len(inputs)}")
-            x, t = inputs
-            inputs_tensor = torch.cat([x, t], dim=1)
-        
-        # Apply Fourier features if enabled
-        features = self.fourier_mapping(inputs_tensor)
-        
-        # Shared features
-        shared_features = self.shared_net(features)
-        
-        # Concentration output with physical constraints
-        c_raw = self.concentration_head(shared_features)
-        c = self.c_offset + self.c_scale * c_raw
-        
-        # Chemical potential output
-        mu = self.chemical_potential_head(shared_features)
-        
-        outputs = {'c': c, 'mu': mu}
-        
-        # Voltage output with physical constraints
-        if self.include_voltage:
-            V_raw = self.voltage_head(shared_features)
-            # Constrain voltage to physically reasonable range
-            V = self.constants.V0 + self.V_scale * torch.tanh(V_raw)
-            outputs['V'] = V
+            features = base_features
             
-        return outputs
+        # Pass through shared network
+        shared_out = self.shared_net(features)
+        
+        # Get raw predictions
+        cu_raw = self.cu_head(shared_out)
+        ni_raw = self.ni_head(shared_out)
+        
+        # Apply boundary condition encoding using a smooth transition function
+        # This ensures exact boundary conditions at y=0 and y=Ly
+        y_ratio = y / self.params['Ly']
+        
+        # Encode top boundary (y = Ly)
+        top_weight = torch.sigmoid(10.0 * (y_ratio - 0.95))  # Smooth transition near top
+        cu_top = self.top_bc_cu * top_weight
+        ni_top = self.top_bc_ni * top_weight
+        
+        # Encode bottom boundary (y = 0)
+        bottom_weight = torch.sigmoid(-10.0 * (y_ratio - 0.05))  # Smooth transition near bottom
+        cu_bottom = self.bottom_bc_cu * bottom_weight
+        ni_bottom = self.bottom_bc_ni * bottom_weight
+        
+        # Combine with interior solution
+        # Interior weight ensures boundary conditions are exact at boundaries
+        interior_weight = (1 - top_weight) * (1 - bottom_weight)
+        
+        c_cu = interior_weight * cu_raw + cu_top + cu_bottom
+        c_ni = interior_weight * ni_raw + ni_top + ni_bottom
+        
+        return torch.cat([c_cu, c_ni], dim=1)
     
-    def initialize_weights(self):
-        """Xavier initialization with physics-aware scaling"""
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        self.apply(init_weights)
-        
-        # Special initialization for concentration head to start near equilibrium
-        if hasattr(self.concentration_head[-2], 'weight'):
-            nn.init.zeros_(self.concentration_head[-2].weight)
-            nn.init.zeros_(self.concentration_head[-2].bias)
-
-# =====================================================
-# OPTIMIZED PHYSICS OPERATORS WITH CACHING
-# =====================================================
-class PhysicsOperators:
-    """Optimized physics operators with caching and numerical stability improvements"""
-    
-    @staticmethod
-    @lru_cache(maxsize=32)
-    def get_operator_key(shape, device):
-        """Generate cache key for operator computations"""
-        return (shape, str(device))
-    
-    @staticmethod
-    def compute_double_well_derivative(c, W, eps=1e-8):
+    def compute_physics_residuals(self, x, y, t):
         """
-        Compute derivative of double-well free energy with numerical stability
-        df/dc = 2Wc(1-c)(1-2c)
+        Compute PDE residuals with automatic differentiation
+        Returns: residual1, residual2, and individual terms for analysis
         """
-        return 2 * W * c * (1 - c + eps) * (1 - 2 * c + eps)
-    
-    @staticmethod
-    def compute_gradient(f, coords, create_graph=True, retain_graph=None):
-        """
-        Efficient gradient computation with automatic graph management
-        """
-        if coords is None or f is None:
-            raise ValueError("Input tensors cannot be None")
+        # Enable gradient tracking
+        x.requires_grad_(True)
+        y.requires_grad_(True)
+        t.requires_grad_(True)
         
-        if not coords.requires_grad:
-            coords.requires_grad = True
+        # Get predictions
+        c_pred = self(x, y, t)
+        c_cu = c_pred[:, 0:1]
+        c_ni = c_pred[:, 1:2]
         
-        # If retain_graph is not specified, set it to create_graph for consistency
-        if retain_graph is None:
-            retain_graph = create_graph
-            
-        grad_outputs = torch.ones_like(f, requires_grad=False)
-        grads = torch.autograd.grad(
-            outputs=f,
-            inputs=coords,
-            grad_outputs=grad_outputs,
-            create_graph=create_graph,
-            retain_graph=retain_graph,
-            allow_unused=True  # Allow unused gradients for flexibility
-        )[0]
+        # First derivatives
+        c_cu_t = torch.autograd.grad(c_cu, t, grad_outputs=torch.ones_like(c_cu),
+                                     create_graph=True, retain_graph=True)[0]
+        c_ni_t = torch.autograd.grad(c_ni, t, grad_outputs=torch.ones_like(c_ni),
+                                     create_graph=True, retain_graph=True)[0]
         
-        # Handle None gradients
-        if grads is None:
-            grads = torch.zeros_like(coords, requires_grad=create_graph)
-            
-        return grads
-    
-    @staticmethod
-    def compute_spherical_laplacian(f, r, eps=1e-12, create_graph=True):
-        """
-        Numerically stable spherical Laplacian computation
-        ∇²f = (1/r²) ∂/∂r(r² ∂f/∂r)
-        Handles singularity at r=0 with series expansion
-        """
-        if r is None or f is None:
-            raise ValueError("Input tensors cannot be None")
+        # Spatial gradients
+        c_cu_x = torch.autograd.grad(c_cu, x, grad_outputs=torch.ones_like(c_cu),
+                                    create_graph=True, retain_graph=True)[0]
+        c_cu_y = torch.autograd.grad(c_cu, y, grad_outputs=torch.ones_like(c_cu),
+                                    create_graph=True, retain_graph=True)[0]
         
-        # Store the original requires_grad state
-        original_requires_grad = r.requires_grad
+        c_ni_x = torch.autograd.grad(c_ni, x, grad_outputs=torch.ones_like(c_ni),
+                                    create_graph=True, retain_graph=True)[0]
+        c_ni_y = torch.autograd.grad(c_ni, y, grad_outputs=torch.ones_like(c_ni),
+                                    create_graph=True, retain_graph=True)[0]
         
-        if not r.requires_grad:
-            r.requires_grad = True
+        # Second derivatives (Laplacian)
+        c_cu_xx = torch.autograd.grad(c_cu_x, x, grad_outputs=torch.ones_like(c_cu_x),
+                                     create_graph=True, retain_graph=True)[0]
+        c_cu_yy = torch.autograd.grad(c_cu_y, y, grad_outputs=torch.ones_like(c_cu_y),
+                                     create_graph=True, retain_graph=True)[0]
         
-        # Compute first derivative
-        f_r = PhysicsOperators.compute_gradient(f, r, create_graph=create_graph, retain_graph=True)
+        c_ni_xx = torch.autograd.grad(c_ni_x, x, grad_outputs=torch.ones_like(c_ni_x),
+                                     create_graph=True, retain_graph=True)[0]
+        c_ni_yy = torch.autograd.grad(c_ni_y, y, grad_outputs=torch.ones_like(c_ni_y),
+                                     create_graph=True, retain_graph=True)[0]
         
-        # Handle r=0 singularity with series expansion (Taylor series)
-        near_zero_mask = (r < 1e-8).squeeze()
-        if torch.any(near_zero_mask):
-            # For points very close to r=0, use series expansion
-            # ∇²f ≈ 3f_rr(0) + O(r²) at r=0
-            f_rr = PhysicsOperators.compute_gradient(f_r, r, create_graph=create_graph, retain_graph=False)
-            lap_f_zero = 3 * f_rr[near_zero_mask]
-            
-            # For other points, use standard formula
-            r2_f_r = r[~near_zero_mask]**2 * f_r[~near_zero_mask]
-            r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r[~near_zero_mask], create_graph=create_graph, retain_graph=False)
-            lap_f = r2_f_r_r / (r[~near_zero_mask]**2 + eps)
-            
-            # Combine results
-            full_lap = torch.zeros_like(r)
-            full_lap[near_zero_mask] = lap_f_zero
-            full_lap[~near_zero_mask] = lap_f
-            return full_lap
+        laplacian_cu = c_cu_xx + c_cu_yy
+        laplacian_ni = c_ni_xx + c_ni_yy
         
-        # Standard computation away from singularity
-        r2_f_r = r**2 * f_r
-        r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r, create_graph=create_graph, retain_graph=False)
-        lap_f = r2_f_r_r / (r**2 + eps)
+        # PDE residuals
+        residual_cu = c_cu_t - (self.params['D11'] * laplacian_cu + 
+                               self.params['D12'] * laplacian_ni)
+        residual_ni = c_ni_t - (self.params['D21'] * laplacian_cu + 
+                               self.params['D22'] * laplacian_ni)
         
-        # Restore original requires_grad state
-        if not original_requires_grad:
-            r.requires_grad = False
-            
-        return lap_f
-    
-    @staticmethod
-    def compute_laplacian_2d(f, x, y, eps=1e-12, create_graph=True):
-        """
-        Memory-efficient 2D Laplacian computation with shared gradients
-        """
-        if x is None or y is None or f is None:
-            raise ValueError("Input tensors cannot be None")
-        
-        # Store original requires_grad states
-        x_requires_grad_original = x.requires_grad
-        y_requires_grad_original = y.requires_grad
-        
-        # Ensure gradients are enabled
-        x.requires_grad = True
-        y.requires_grad = True
-        
-        try:
-            # Compute gradients for x and y simultaneously to reduce graph operations
-            # First compute gradients
-            f_grads = torch.autograd.grad(
-                outputs=f,
-                inputs=[x, y],
-                grad_outputs=torch.ones_like(f),
-                create_graph=create_graph,
-                retain_graph=True,
-                allow_unused=True
-            )
-            
-            f_x, f_y = f_grads
-            
-            # Handle None gradients
-            if f_x is None:
-                f_x = torch.zeros_like(x, requires_grad=create_graph)
-            if f_y is None:
-                f_y = torch.zeros_like(y, requires_grad=create_graph)
-            
-            # Compute second derivatives
-            f_xx = PhysicsOperators.compute_gradient(f_x, x, create_graph=create_graph, retain_graph=False)
-            f_yy = PhysicsOperators.compute_gradient(f_y, y, create_graph=create_graph, retain_graph=False)
-            
-            return f_xx + f_yy
-            
-        finally:
-            # Restore original requires_grad states
-            if not x_requires_grad_original:
-                x.requires_grad = False
-            if not y_requires_grad_original:
-                y.requires_grad = False
-
-# =====================================================
-# ADAPTIVE SAMPLING AND DOMAIN MANAGEMENT
-# =====================================================
-class AdaptiveSampler:
-    """
-    Adaptive sampling strategy that focuses on regions of high physics residuals
-    and physical interest
-    """
-    def __init__(self, constants, geometry='cartesian_2d', num_points=1000):
-        self.constants = constants
-        self.geometry = geometry
-        self.num_points = num_points
-        self.device = constants.device
-        self.sampler = qmc.Sobol(d=3, scramble=True)  # Low-discrepancy sequence
-        self.residual_history = []
-        self.points_cache = {}
-        
-    def sample_domain(self, model=None, epoch=None, loss_weights=None):
-        """
-        Sample points with adaptive strategy based on physics residuals
-        """
-        if model is None or epoch is None or epoch < 100 or loss_weights is None:
-            return self.uniform_sample()
-        
-        # Adaptive sampling based on residual analysis
-        return self.residual_adaptive_sample(model, loss_weights)
-    
-    def uniform_sample(self):
-        """Uniform sampling with low-discrepancy sequence"""
-        if self.geometry == 'cartesian_2d':
-            # Use Sobol sequence for better coverage
-            try:
-                num_points = max(self.num_points, 1)
-                power = int(np.ceil(np.log2(num_points)))
-                samples = self.sampler.random_base2(m=power)
-                samples = samples[:num_points]
-            except Exception as e:
-                st.warning(f"Sampling error: {e}. Using random sampling instead.")
-                samples = np.random.random((num_points, 3))
-            
-            x = torch.tensor(samples[:, 0] * self.constants.Lx, device=self.device, dtype=torch.float32).view(-1, 1)
-            y = torch.tensor(samples[:, 1] * self.constants.Ly, device=self.device, dtype=torch.float32).view(-1, 1)
-            t = torch.tensor(samples[:, 2] * self.constants.T_max, device=self.device, dtype=torch.float32).view(-1, 1)
-            return {'x': x, 'y': y, 't': t}
-        
-        elif self.geometry == 'spherical_1d':
-            try:
-                num_points = max(self.num_points, 1)
-                power = int(np.ceil(np.log2(num_points)))
-                samples = self.sampler.random_base2(m=power)
-                samples = samples[:num_points]
-            except Exception as e:
-                st.warning(f"Sampling error: {e}. Using random sampling instead.")
-                samples = np.random.random((num_points, 2))
-            
-            r = torch.tensor(samples[:, 0] * self.constants.particle_radius, device=self.device, dtype=torch.float32).view(-1, 1)
-            t = torch.tensor(samples[:, 1] * self.constants.T_max, device=self.device, dtype=torch.float32).view(-1, 1)
-            return {'r': r, 't': t}
-    
-    def residual_adaptive_sample(self, model, loss_weights):
-        """
-        Sample more points in regions with high physics residuals
-        """
-        # Get baseline uniform samples
-        samples = self.uniform_sample()
-        
-        # Use a separate graph for residual computation to avoid interference
-        # We'll create a detached copy of the model for residual computation
-        model_copy = copy.deepcopy(model)
-        model_copy.eval()
-        
-        # Detach model parameters to avoid gradient accumulation
-        for param in model_copy.parameters():
-            param.requires_grad = False
-        
-        if self.geometry == 'cartesian_2d':
-            x, y, t = samples['x'], samples['y'], samples['t']
-            
-            # Enable gradients for coordinates
-            x = x.detach().clone().requires_grad_(True)
-            y = y.detach().clone().requires_grad_(True)
-            t = t.detach().clone().requires_grad_(True)
-            
-            # Forward pass with model copy (no gradients for model parameters)
-            with torch.no_grad():
-                outputs = model_copy(x, y, t)
-                c = outputs['c']
-                mu = outputs['mu']
-            
-            # Compute physics residuals with a fresh graph
-            # We need to enable gradients for the outputs
-            c = c.detach().requires_grad_(True)
-            mu = mu.detach().requires_grad_(True)
-            
-            # Compute double well derivative
-            df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-            
-            # Compute Laplacian of c with create_graph=False to avoid building large graph
-            lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y, create_graph=False)
-            mu_physics = df_dc - self.constants.kappa * lap_c
-            mu_residual = torch.abs(mu - mu_physics)
-            
-            # Time derivative
-            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False, retain_graph=False)
-            
-            # Laplacian of mu
-            mu_lap = PhysicsOperators.compute_laplacian_2d(mu, x, y, create_graph=False)
-            evol_residual = torch.abs(c_t - self.constants.M * mu_lap)
-            
-            # Combined residual for sampling weights
-            residual = (loss_weights['pde_mu'] * mu_residual + 
-                       loss_weights['pde_evol'] * evol_residual)
-        else:  # spherical_1d
-            r, t = samples['r'], samples['t']
-            
-            # Enable gradients for coordinates
-            r = r.detach().clone().requires_grad_(True)
-            t = t.detach().clone().requires_grad_(True)
-            
-            # Forward pass with model copy
-            with torch.no_grad():
-                outputs = model_copy(r, t)
-                c = outputs['c']
-                mu = outputs['mu']
-            
-            # Enable gradients for outputs
-            c = c.detach().requires_grad_(True)
-            mu = mu.detach().requires_grad_(True)
-            
-            # Compute residuals
-            df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-            lap_c = PhysicsOperators.compute_spherical_laplacian(c, r, create_graph=False)
-            mu_physics = df_dc - self.constants.kappa * lap_c
-            mu_residual = torch.abs(mu - mu_physics)
-            
-            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False, retain_graph=False)
-            lap_mu = PhysicsOperators.compute_spherical_laplacian(mu, r, create_graph=False)
-            evol_residual = torch.abs(c_t - self.constants.M * lap_mu)
-            
-            residual = (loss_weights['pde_mu'] * mu_residual + 
-                       loss_weights['pde_evol'] * evol_residual)
-        
-        # Detach residuals from computation graph before converting to numpy
-        residual = residual.detach()
-        
-        # Clean up to free memory
-        del model_copy
-        
-        # Create sampling weights based on residuals
-        weights = residual.squeeze().cpu().numpy()
-        if np.sum(weights) == 0:
-            weights = np.ones_like(weights)
-        weights = weights / (np.sum(weights) + 1e-12)
-        
-        # Sample based on weights
-        try:
-            indices = np.random.choice(len(weights), size=self.num_points, p=weights, replace=True)
-        except ValueError:
-            indices = np.random.choice(len(weights), size=self.num_points, replace=True)
-        
-        # Create new samples
-        if self.geometry == 'cartesian_2d':
-            # Return original samples without gradients for training
-            return {
-                'x': samples['x'][indices].detach().clone().requires_grad_(True),
-                'y': samples['y'][indices].detach().clone().requires_grad_(True),
-                't': samples['t'][indices].detach().clone().requires_grad_(True)
-            }
-        else:
-            return {
-                'r': samples['r'][indices].detach().clone().requires_grad_(True),
-                't': samples['t'][indices].detach().clone().requires_grad_(True)
-            }
-    
-    def sample_boundary(self, num_points=100):
-        """Sample boundary points with appropriate weighting"""
-        if self.geometry == 'cartesian_2d':
-            # Sample boundaries with equal weighting
-            boundary_points = max(1, int(num_points / 4))
-            samples = {}
-            
-            # Left boundary (x=0)
-            y_left = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
-            t_left = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            samples['left'] = {
-                'x': torch.zeros(boundary_points, 1, device=self.device, dtype=torch.float32),
-                'y': y_left,
-                't': t_left
-            }
-            
-            # Right boundary (x=Lx)
-            y_right = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
-            t_right = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            samples['right'] = {
-                'x': torch.full((boundary_points, 1), self.constants.Lx, device=self.device, dtype=torch.float32),
-                'y': y_right,
-                't': t_right
-            }
-            
-            # Bottom boundary (y=0)
-            x_bottom = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
-            t_bottom = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            samples['bottom'] = {
-                'x': x_bottom,
-                'y': torch.zeros(boundary_points, 1, device=self.device, dtype=torch.float32),
-                't': t_bottom
-            }
-            
-            # Top boundary (y=Ly)
-            x_top = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
-            t_top = torch.rand(boundary_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            samples['top'] = {
-                'x': x_top,
-                'y': torch.full((boundary_points, 1), self.constants.Ly, device=self.device, dtype=torch.float32),
-                't': t_top
-            }
-            
-            return samples
-        
-        elif self.geometry == 'spherical_1d':
-            # Center and surface boundaries
-            t_vals = torch.rand(num_points, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            
-            return {
-                'center': {
-                    'r': torch.zeros(num_points, 1, device=self.device, dtype=torch.float32),
-                    't': t_vals
-                },
-                'surface': {
-                    'r': torch.full((num_points, 1), self.constants.particle_radius, device=self.device, dtype=torch.float32),
-                    't': t_vals
-                }
-            }
-
-# =====================================================
-# OPTIMIZED PHYSICS LOSS FUNCTIONS WITH MIXED PRECISION
-# =====================================================
-class PhysicsLossCalculator:
-    """
-    Optimized loss calculator with mixed precision support and numerical stability
-    """
-    def __init__(self, constants, geometry='cartesian_2d', device='cpu'):
-        self.constants = constants
-        self.geometry = geometry
-        self.device = device
-        self.scaler = GradScaler() if device == 'cuda' else None
-        self.loss_weights = {
-            'pde_mu': 1.0, 'pde_evol': 1.0, 'bc': 10.0, 'ic': 10.0,
-            'voltage': 5.0, 'data': 2.0, 'interface': 1.0
+        # Return all terms for analysis
+        physics_info = {
+            'residuals': (residual_cu, residual_ni),
+            'gradients': {
+                'c_cu_t': c_cu_t, 'c_ni_t': c_ni_t,
+                'c_cu_x': c_cu_x, 'c_cu_y': c_cu_y,
+                'c_ni_x': c_ni_x, 'c_ni_y': c_ni_y
+            },
+            'laplacians': (laplacian_cu, laplacian_ni)
         }
-    
-    def update_loss_weights(self, epoch, total_epochs=5000):
-        """Adaptive loss weighting based on training progress"""
-        progress = epoch / total_epochs
         
-        # Increase physics constraint weights as training progresses
-        self.loss_weights['bc'] = 10.0 * (1 + 2 * progress)
-        self.loss_weights['ic'] = 10.0 * (1 + 2 * progress)
-        
-        # Focus more on PDE satisfaction in later stages
-        self.loss_weights['pde_mu'] = 1.0 * (1 + progress)
-        self.loss_weights['pde_evol'] = 1.0 * (1 + progress)
-        
-        # Interface regularization becomes more important
-        self.loss_weights['interface'] = 1.0 * progress
-    
-    def compute_pde_loss_cartesian_2d(self, model, x, y, t, use_mixed_precision=False):
-        """Optimized PDE loss computation for 2D Cartesian coordinates"""
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_pde_loss_cartesian_2d(model, x, y, t)
-        return self._compute_pde_loss_cartesian_2d(model, x, y, t)
-    
-    def _compute_pde_loss_cartesian_2d(self, model, x, y, t):
-        # Store original states
-        x_requires_grad = x.requires_grad
-        y_requires_grad = y.requires_grad
-        t_requires_grad = t.requires_grad
-        
-        # Ensure gradients are enabled
-        x = x.requires_grad_(True)
-        y = y.requires_grad_(True)
-        t = t.requires_grad_(True)
-        
-        # Get predictions in a single forward pass
-        outputs = model(x, y, t)
-        c = outputs['c']
-        mu_pred = outputs['mu']
-        
-        # Compute chemical potential from physics
-        df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-        lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y, create_graph=True)
-        mu_physics = df_dc - self.constants.kappa * lap_c
-        
-        # Chemical potential residual
-        mu_residual = mu_pred - mu_physics
-        
-        # Time derivative of concentration
-        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True, retain_graph=True)
-        
-        # Laplacian of chemical potential
-        lap_mu = PhysicsOperators.compute_laplacian_2d(mu_pred, x, y, create_graph=True)
-        
-        # Cahn-Hilliard evolution: ∂c/∂t = M∇²μ
-        evol_residual = c_t - self.constants.M * lap_mu
-        
-        # Interface regularization - penalize concentrations outside [c_alpha, c_beta]
-        interface_penalty = torch.relu(c - self.constants.c_beta)**2 + torch.relu(self.constants.c_alpha - c)**2
-        
-        # Total PDE loss with weighted components
-        pde_loss = (
-            self.loss_weights['pde_mu'] * torch.mean(mu_residual**2) +
-            self.loss_weights['pde_evol'] * torch.mean(evol_residual**2) +
-            self.loss_weights['interface'] * torch.mean(interface_penalty)
-        )
-        
-        # Restore original states
-        if not x_requires_grad:
-            x.requires_grad_(False)
-        if not y_requires_grad:
-            y.requires_grad_(False)
-        if not t_requires_grad:
-            t.requires_grad_(False)
-        
-        return pde_loss
-    
-    def compute_pde_loss_spherical_1d(self, model, r, t, use_mixed_precision=False):
-        """Optimized PDE loss computation for 1D spherical coordinates"""
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_pde_loss_spherical_1d(model, r, t)
-        return self._compute_pde_loss_spherical_1d(model, r, t)
-    
-    def _compute_pde_loss_spherical_1d(self, model, r, t):
-        # Store original states
-        r_requires_grad = r.requires_grad
-        t_requires_grad = t.requires_grad
-        
-        # Ensure gradients are enabled
-        r = r.requires_grad_(True)
-        t = t.requires_grad_(True)
-        
-        outputs = model(r, t)
-        c = outputs['c']
-        mu_pred = outputs['mu']
-        
-        # Chemical potential from physics
-        df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-        lap_c = PhysicsOperators.compute_spherical_laplacian(c, r, create_graph=True)
-        mu_physics = df_dc - self.constants.kappa * lap_c
-        
-        # Chemical potential residual
-        mu_residual = mu_pred - mu_physics
-        
-        # Time derivative
-        c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True, retain_graph=True)
-        
-        # Spherical Laplacian of chemical potential
-        lap_mu = PhysicsOperators.compute_spherical_laplacian(mu_pred, r, create_graph=True)
-        
-        # Evolution equation in spherical coordinates
-        evol_residual = c_t - self.constants.M * lap_mu
-        
-        # Interface regularization
-        interface_penalty = torch.relu(c - self.constants.c_beta)**2 + torch.relu(self.constants.c_alpha - c)**2
-        
-        # Total PDE loss
-        pde_loss = (
-            self.loss_weights['pde_mu'] * torch.mean(mu_residual**2) +
-            self.loss_weights['pde_evol'] * torch.mean(evol_residual**2) +
-            self.loss_weights['interface'] * torch.mean(interface_penalty)
-        )
-        
-        # Restore original states
-        if not r_requires_grad:
-            r.requires_grad_(False)
-        if not t_requires_grad:
-            t.requires_grad_(False)
-        
-        return pde_loss
-    
-    def compute_boundary_loss(self, model, samples, use_mixed_precision=False):
-        """Optimized boundary condition loss computation"""
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_boundary_loss(model, samples)
-        return self._compute_boundary_loss(model, samples)
-    
-    def _compute_boundary_loss(self, model, samples):
-        total_bc_loss = 0.0
-        bc_count = 0
-        
-        if self.geometry == 'cartesian_2d':
-            # Process each boundary
-            for boundary_name, boundary_samples in samples.items():
-                if boundary_samples is None or len(boundary_samples) == 0:
-                    continue
-                    
-                x = boundary_samples['x'].detach().clone().requires_grad_(True)
-                y = boundary_samples['y'].detach().clone().requires_grad_(True)
-                t = boundary_samples['t'].detach().clone().requires_grad_(True)
-                
-                outputs = model(x, y, t)
-                c = outputs['c']
-                mu = outputs['mu']
-                
-                if boundary_name in ['left', 'right']:  # x boundaries
-                    c_x = PhysicsOperators.compute_gradient(c, x, create_graph=True, retain_graph=True)
-                    mu_x = PhysicsOperators.compute_gradient(mu, x, create_graph=True, retain_graph=False)
-                    bc_loss = torch.mean(c_x**2 + mu_x**2)
-                else:  # y boundaries
-                    c_y = PhysicsOperators.compute_gradient(c, y, create_graph=True, retain_graph=True)
-                    mu_y = PhysicsOperators.compute_gradient(mu, y, create_graph=True, retain_graph=False)
-                    bc_loss = torch.mean(c_y**2 + mu_y**2)
-                
-                total_bc_loss += bc_loss
-                bc_count += 1
-        
-        elif self.geometry == 'spherical_1d':
-            # Center boundary (r=0): symmetry condition
-            if 'center' in samples and samples['center'] is not None:
-                r_center = samples['center']['r'].detach().clone().requires_grad_(True)
-                t_center = samples['center']['t'].detach().clone().requires_grad_(True)
-                
-                outputs_center = model(r_center, t_center)
-                c_center = outputs_center['c']
-                
-                # Use small r for numerical stability
-                r_small = torch.full_like(r_center, 1e-9).requires_grad_(True)
-                outputs_small = model(r_small, t_center)
-                c_small = outputs_small['c']
-                
-                # Approximate gradient at center
-                c_grad_center = (c_small - c_center) / 1e-9
-                center_loss = torch.mean(c_grad_center**2)
-                total_bc_loss += center_loss
-                bc_count += 1
-            
-            # Surface boundary (r=R): Butler-Volmer kinetics if voltage is included
-            if model.include_voltage and 'surface' in samples and samples['surface'] is not None:
-                r_surface = samples['surface']['r'].detach().clone().requires_grad_(True)
-                t_surface = samples['surface']['t'].detach().clone().requires_grad_(True)
-                
-                outputs_surface = model(r_surface, t_surface)
-                c_surface = outputs_surface['c']
-                mu_surface = outputs_surface['mu']
-                V_pred = outputs_surface['V']
-                
-                # Compute equilibrium voltage
-                V_eq = self.constants.V0 - (1/self.constants.F) * mu_surface
-                
-                # Overpotential
-                eta = V_pred - V_eq
-                
-                # Butler-Volmer flux (converted to mol/m²·s)
-                F_by_RT = self.constants.F / (self.constants.R * self.constants.T)
-                j_BV = (self.constants.i0 / self.constants.F) * (
-                    torch.exp(self.constants.alpha * F_by_RT * eta) -
-                    torch.exp(-(1 - self.constants.alpha) * F_by_RT * eta)
-                )
-                
-                # Compute actual flux from model (M * ∂μ/∂r at surface)
-                mu_r_surface = PhysicsOperators.compute_gradient(mu_surface, r_surface, create_graph=True, retain_graph=False)
-                actual_flux = self.constants.M * mu_r_surface
-                
-                # Flux matching loss
-                flux_loss = torch.mean((actual_flux - j_BV)**2)
-                total_bc_loss += flux_loss
-                bc_count += 1
-        
-        return total_bc_loss / bc_count if bc_count > 0 else torch.tensor(0.0, device=self.device)
-    
-    def compute_initial_condition_loss(self, model, use_mixed_precision=False):
-        """Optimized initial condition loss computation"""
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_initial_condition_loss(model)
-        return self._compute_initial_condition_loss(model)
-    
-    def _compute_initial_condition_loss(self, model):
-        if self.geometry == 'cartesian_2d':
-            x = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
-            y = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
-            t = torch.zeros(500, 1, device=self.device, dtype=torch.float32)
-            
-            outputs = model(x, y, t)
-            c_pred = outputs['c']
-            
-            # Initial condition: uniform concentration with small fluctuations
-            c0 = self.constants.c_avg + 0.05 * torch.randn_like(c_pred, device=self.device)
-            ic_loss = torch.mean((c_pred - c0)**2)
-            
-            return ic_loss
-        
-        elif self.geometry == 'spherical_1d':
-            r = torch.rand(500, 1, device=self.device, dtype=torch.float32) * self.constants.particle_radius
-            t = torch.zeros(500, 1, device=self.device, dtype=torch.float32)
-            
-            outputs = model(r, t)
-            c_pred = outputs['c']
-            
-            # Initial condition: linear gradient from center to surface
-            r_norm = r / self.constants.particle_radius
-            c0 = self.constants.c_alpha + (self.constants.c_beta - self.constants.c_alpha) * r_norm
-            ic_loss = torch.mean((c_pred - c0)**2)
-            
-            return ic_loss
-        
-        return torch.tensor(0.0, device=self.device)
-    
-    def compute_voltage_constraint_loss(self, model, use_mixed_precision=False):
-        """Optimized voltage constraint loss computation"""
-        if not model.include_voltage:
-            return torch.tensor(0.0, device=self.device)
-        
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_voltage_constraint_loss(model)
-        return self._compute_voltage_constraint_loss(model)
-    
-    def _compute_voltage_constraint_loss(self, model):
-        if self.geometry == 'cartesian_2d':
-            x = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.Lx
-            y = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.Ly
-            t = torch.rand(200, 1, device=self.device, dtype=torch.float32) * self.constants.T_max
-            
-            x.requires_grad = True
-            y.requires_grad = True
-            t.requires_grad = True
-            
-            outputs = model(x, y, t)
-            V_pred = outputs['V']
-            mu_pred = outputs['mu']
-            
-            # Spatial average of chemical potential
-            mu_avg = torch.mean(mu_pred)
-            
-            # Voltage constraint from Nernst equation
-            V_constraint = self.constants.V0 - (1/self.constants.F) * mu_avg
-            
-            # Add small regularization to keep voltage physically reasonable
-            voltage_reg = torch.relu(torch.abs(V_pred - self.constants.V0) - 0.5)**2
-            
-            voltage_loss = torch.mean((V_pred - V_constraint)**2) + 0.1 * torch.mean(voltage_reg)
-            
-            return voltage_loss
-        
-        return torch.tensor(0.0, device=self.device)
-    
-    def compute_experimental_data_loss(self, model, experimental_data, use_mixed_precision=False):
-        """Optimized experimental data loss computation"""
-        if experimental_data is None or len(experimental_data) == 0:
-            return torch.tensor(0.0, device=self.device)
-        
-        if use_mixed_precision and self.scaler is not None:
-            with autocast():
-                return self._compute_experimental_data_loss(model, experimental_data)
-        return self._compute_experimental_data_loss(model, experimental_data)
-    
-    def _compute_experimental_data_loss(self, model, experimental_data):
-        total_loss = 0.0
-        count = 0
-        
-        for data_point in experimental_data:
-            if 'type' not in data_point:
-                continue
-            
-            if data_point['type'] == 'voltage' and model.include_voltage:
-                # Voltage vs time data
-                t_data = torch.tensor(data_point['time'], dtype=torch.float32, 
-                                     device=self.device).reshape(-1, 1)
-                
-                if self.geometry == 'cartesian_2d':
-                    # Sample multiple spatial points for better averaging
-                    num_spatial = 5
-                    x = torch.linspace(0, self.constants.Lx, num_spatial, device=self.device, dtype=torch.float32)
-                    y = torch.linspace(0, self.constants.Ly, num_spatial, device=self.device, dtype=torch.float32)
-                    X, Y = torch.meshgrid(x, y, indexing='ij')
-                    
-                    total_V_pred = 0
-                    for i in range(num_spatial):
-                        for j in range(num_spatial):
-                            x_pt = X[i,j].view(1,1).expand(len(t_data), 1)
-                            y_pt = Y[i,j].view(1,1).expand(len(t_data), 1)
-                            outputs = model(x_pt, y_pt, t_data)
-                            total_V_pred += outputs['V']
-                    
-                    V_pred = total_V_pred / (num_spatial * num_spatial)
-                else:
-                    r = torch.full_like(t_data, self.constants.particle_radius * 0.5)
-                    outputs = model(r, t_data)
-                    V_pred = outputs['V']
-                
-                V_data = torch.tensor(data_point['voltage'], dtype=torch.float32, 
-                                     device=self.device).reshape(-1, 1)
-                
-                # Weight loss by inverse variance if provided
-                if 'variance' in data_point:
-                    weights = 1.0 / torch.tensor(data_point['variance'], dtype=torch.float32, 
-                                                device=self.device).reshape(-1, 1)
-                    weights = weights / torch.sum(weights)
-                    point_loss = torch.sum(weights * (V_pred - V_data)**2)
-                else:
-                    point_loss = torch.mean((V_pred - V_data)**2)
-                
-                total_loss += point_loss
-                count += 1
-            
-            elif data_point['type'] == 'concentration_profile':
-                # Concentration profile at specific time
-                t_val = data_point['time']
-                t_data = torch.full((len(data_point['x']), 1), t_val, 
-                                   dtype=torch.float32, device=self.device)
-                
-                if self.geometry == 'cartesian_2d':
-                    x_data = torch.tensor(data_point['x'], dtype=torch.float32, 
-                                         device=self.device).reshape(-1, 1)
-                    y_data = torch.tensor(data_point['y'], dtype=torch.float32, 
-                                         device=self.device).reshape(-1, 1)
-                    outputs = model(x_data, y_data, t_data)
-                else:
-                    r_data = torch.tensor(data_point['r'], dtype=torch.float32, 
-                                         device=self.device).reshape(-1, 1)
-                    outputs = model(r_data, t_data)
-                
-                c_pred = outputs['c']
-                c_data = torch.tensor(data_point['concentration'], dtype=torch.float32, 
-                                     device=self.device).reshape(-1, 1)
-                
-                point_loss = torch.mean((c_pred - c_data)**2)
-                total_loss += point_loss
-                count += 1
-        
-        return total_loss / count if count > 0 else torch.tensor(0.0, device=self.device)
+        return physics_info
 
-# =====================================================
-# ADVANCED TRAINING MANAGER WITH CHECKPOINTING
-# =====================================================
-class TrainingManager:
+# ============================================================================
+# 4. LOSS FUNCTIONS WITH ADAPTIVE WEIGHTING
+# ============================================================================
+
+class AdaptiveLossWeights:
+    """Dynamically adjust loss weights during training"""
+    
+    def __init__(self, initial_weights=None):
+        if initial_weights is None:
+            initial_weights = {
+                'physics': 1.0,
+                'boundary_bottom': 100.0,
+                'boundary_top': 100.0,
+                'boundary_sides': 100.0,
+                'initial': 100.0,
+                'mass_conservation': 10.0
+            }
+        self.weights = initial_weights
+        self.history = {key: [] for key in initial_weights}
+        self.update_frequency = 100
+        
+    def update(self, losses, epoch):
+        """Update weights based on loss ratios"""
+        if epoch % self.update_frequency == 0:
+            total_loss = sum(losses.values())
+            for key in self.weights:
+                if total_loss > 0:
+                    loss_ratio = losses[key] / total_loss
+                    # Increase weight if loss component is relatively high
+                    self.weights[key] *= (1.0 + 0.1 * loss_ratio)
+                    
+        # Store current weights
+        for key in self.weights:
+            self.history[key].append(self.weights[key])
+            
+        return self.weights
+
+def compute_physics_loss(model, points_dict):
     """
-    Advanced training manager with checkpointing, early stopping, and optimization
+    Compute physics loss at collocation points
+    points_dict: dictionary with 'x', 'y', 't' tensors
     """
-    def __init__(self, model, constants, geometry='cartesian_2d', 
-                 include_voltage=True, experimental_data=None,
-                 device='cpu', checkpoint_dir='checkpoints'):
+    physics_info = model.compute_physics_residuals(
+        points_dict['x'], points_dict['y'], points_dict['t']
+    )
+    residual_cu, residual_ni = physics_info['residuals']
+    
+    # L2 norm of residuals
+    loss_physics = torch.mean(residual_cu**2 + residual_ni**2)
+    
+    # Additional regularization: gradient penalty
+    gradients = physics_info['gradients']
+    grad_norm = sum(torch.mean(g**2) for g in gradients.values())
+    
+    return loss_physics + 0.01 * grad_norm, physics_info
+
+def compute_boundary_loss(model, boundary_type='bottom'):
+    """
+    Compute boundary loss for specific boundary
+    boundary_type: 'bottom', 'top', 'left', 'right'
+    """
+    num_points = 500
+    
+    if boundary_type == 'bottom':
+        x = torch.rand(num_points, 1, requires_grad=True) * model.params['Lx']
+        y = torch.zeros(num_points, 1, requires_grad=True)
+        target_cu = model.params['C_CU_BOTTOM']
+        target_ni = model.params['C_NI_BOTTOM']
+        
+    elif boundary_type == 'top':
+        x = torch.rand(num_points, 1, requires_grad=True) * model.params['Lx']
+        y = torch.full((num_points, 1), model.params['Ly'], requires_grad=True)
+        target_cu = model.params['C_CU_TOP']
+        target_ni = model.params['C_NI_TOP']
+        
+    elif boundary_type == 'left':
+        x = torch.zeros(num_points, 1, requires_grad=True)
+        y = torch.rand(num_points, 1, requires_grad=True) * model.params['Ly']
+        # Zero flux condition: ∂c/∂x = 0
+        c_pred = model(x, y, torch.rand(num_points, 1) * model.params['T_max'])
+        c_cu = c_pred[:, 0:1]
+        c_ni = c_pred[:, 1:2]
+        
+        grad_cu_x = torch.autograd.grad(c_cu, x, grad_outputs=torch.ones_like(c_cu),
+                                       create_graph=True, retain_graph=True)[0]
+        grad_ni_x = torch.autograd.grad(c_ni, x, grad_outputs=torch.ones_like(c_ni),
+                                       create_graph=True, retain_graph=True)[0]
+        
+        return torch.mean(grad_cu_x**2 + grad_ni_x**2)
+        
+    elif boundary_type == 'right':
+        x = torch.full((num_points, 1), model.params['Lx'], requires_grad=True)
+        y = torch.rand(num_points, 1, requires_grad=True) * model.params['Ly']
+        # Zero flux condition: ∂c/∂x = 0
+        c_pred = model(x, y, torch.rand(num_points, 1) * model.params['T_max'])
+        c_cu = c_pred[:, 0:1]
+        c_ni = c_pred[:, 1:2]
+        
+        grad_cu_x = torch.autograd.grad(c_cu, x, grad_outputs=torch.ones_like(c_cu),
+                                       create_graph=True, retain_graph=True)[0]
+        grad_ni_x = torch.autograd.grad(c_ni, x, grad_outputs=torch.ones_like(c_ni),
+                                       create_graph=True, retain_graph=True)[0]
+        
+        return torch.mean(grad_cu_x**2 + grad_ni_x**2)
+    
+    else:
+        raise ValueError(f"Unknown boundary type: {boundary_type}")
+    
+    t = torch.rand(num_points, 1, requires_grad=True) * model.params['T_max']
+    c_pred = model(x, y, t)
+    
+    loss_cu = torch.mean((c_pred[:, 0] - target_cu)**2)
+    loss_ni = torch.mean((c_pred[:, 1] - target_ni)**2)
+    
+    return loss_cu + loss_ni
+
+def compute_initial_loss(model):
+    """Compute loss for initial condition (t=0)"""
+    num_points = 1000
+    x = torch.rand(num_points, 1, requires_grad=True) * model.params['Lx']
+    y = torch.rand(num_points, 1, requires_grad=True) * model.params['Ly']
+    t = torch.zeros(num_points, 1, requires_grad=True)
+    
+    c_pred = model(x, y, t)
+    # Initial condition: zero concentration everywhere
+    return torch.mean(c_pred**2)
+
+def compute_mass_conservation_loss(model, points_dict):
+    """
+    Compute mass conservation loss (optional)
+    For systems with no sources/sinks, total mass should be conserved
+    """
+    # This is an approximate check - full conservation would require integration
+    c_pred = model(points_dict['x'], points_dict['y'], points_dict['t'])
+    c_cu, c_ni = c_pred[:, 0], c_pred[:, 1]
+    
+    # Check variance of total concentration (should be relatively constant)
+    total_concentration = c_cu + c_ni
+    variance = torch.var(total_concentration)
+    
+    return variance
+
+# ============================================================================
+# 5. TRAINING MANAGER WITH ADVANCED FEATURES
+# ============================================================================
+
+class PINNTrainer:
+    """
+    Comprehensive training manager for PINNs with:
+    - Adaptive sampling
+    - Multiple optimization strategies
+    - Advanced logging and checkpointing
+    - Convergence monitoring
+    """
+    
+    def __init__(self, model, params, output_dir):
         self.model = model
-        self.constants = constants
-        self.geometry = geometry
-        self.include_voltage = include_voltage
-        self.experimental_data = experimental_data
-        self.device = device
-        self.checkpoint_dir = checkpoint_dir
+        self.params = params
+        self.output_dir = output_dir
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        
+        # Training configuration
+        self.config = {
+            'epochs': 10000,
+            'initial_lr': 1e-3,
+            'batch_size': 4096,
+            'validation_freq': 100,
+            'checkpoint_freq': 500,
+            'adaptive_sampling_freq': 200
+        }
+        
+        # Point generators for different loss components
+        self.point_generators = self._initialize_point_generators()
+        
+        # Loss tracker
+        self.loss_history = {
+            'total': [], 'physics': [], 'boundary_bottom': [],
+            'boundary_top': [], 'boundary_sides': [], 'initial': [],
+            'learning_rate': [], 'gradient_norm': []
+        }
+        
+        # Adaptive loss weights
+        self.loss_weights = AdaptiveLossWeights()
+        
+        # Setup optimizers and schedulers
+        self._setup_optimization()
         
         # Create checkpoint directory
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        self.checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         
-        # Initialize components
-        self.loss_calculator = PhysicsLossCalculator(constants, geometry, device)
-        self.adaptive_sampler = AdaptiveSampler(constants, geometry, num_points=1000)
+    def _initialize_point_generators(self):
+        """Initialize point generators for different domains"""
+        generators = {}
         
-        # Training state
-        self.best_model = None
-        self.best_loss = float('inf')
-        self.early_stop_counter = 0
-        self.patience = 300
-        self.min_delta = 1e-6
-        
-        # Training history
-        self.history = {
-            'total_loss': [],
-            'pde_loss': [],
-            'bc_loss': [],
-            'ic_loss': [],
-            'voltage_loss': [],
-            'data_loss': [],
-            'learning_rate': [],
-            'training_time': []
+        # Interior points for PDE
+        generators['interior'] = {
+            'num_points': 10000,
+            'x_range': (0, self.params['Lx']),
+            'y_range': (0, self.params['Ly']),
+            't_range': (0, self.params['T_max'])
         }
-    
-    def setup_optimizer(self, lr=1e-3, weight_decay=1e-5, use_lookahead=False):
-        """Setup optimized training components"""
-        # Use mixed precision if available
-        self.use_mixed_precision = (self.device == 'cuda' and hasattr(torch.cuda, 'amp'))
         
-        # Base optimizer with weight decay
-        base_optimizer = optim.AdamW(
-            self.model.parameters(), 
-            lr=lr, 
-            weight_decay=weight_decay,
+        # Boundary points
+        for boundary in ['bottom', 'top', 'left', 'right']:
+            generators[boundary] = {
+                'num_points': 2000,
+                'boundary': boundary
+            }
+            
+        # Initial condition points
+        generators['initial'] = {
+            'num_points': 5000,
+            't_value': 0.0
+        }
+        
+        return generators
+    
+    def _setup_optimization(self):
+        """Setup optimizers and learning rate schedulers"""
+        
+        # Main optimizer with weight decay
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.config['initial_lr'],
+            weight_decay=1e-6,
             betas=(0.9, 0.999)
         )
         
-        # Learning rate scheduler with warmup
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            base_optimizer, 
-            mode='min', 
-            factor=0.5, 
-            patience=100
+        # Learning rate schedulers
+        self.scheduler = {
+            'plateau': ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.5, 
+                patience=200, verbose=True, min_lr=1e-6
+            ),
+            'cosine': CosineAnnealingLR(
+                self.optimizer, T_max=self.config['epochs'], 
+                eta_min=1e-6
+            )
+        }
+        
+        # Gradient clipping
+        self.grad_clip_value = 1.0
+        
+    def _generate_points(self, generator_type, adaptive=False, residual_info=None):
+        """
+        Generate points for training, optionally with adaptive sampling
+        based on residual magnitudes
+        """
+        gen_config = self.point_generators[generator_type]
+        
+        if generator_type == 'interior':
+            if adaptive and residual_info is not None:
+                # Adaptive sampling: generate more points in high-residual regions
+                residual_cu, residual_ni = residual_info
+                residuals = torch.abs(residual_cu) + torch.abs(residual_ni)
+                
+                # Sample points proportional to residuals
+                probabilities = residuals.detach().cpu().numpy().flatten()
+                probabilities = probabilities / (probabilities.sum() + 1e-10)
+                
+                # Generate new points
+                num_new = gen_config['num_points']
+                idx = np.random.choice(
+                    len(probabilities), 
+                    size=num_new, 
+                    p=probabilities,
+                    replace=True
+                )
+                
+                # Get corresponding coordinates (would need to store them)
+                # For simplicity, fall back to uniform sampling
+                pass
+                
+            # Uniform sampling
+            x = torch.rand(gen_config['num_points'], 1) * self.params['Lx']
+            y = torch.rand(gen_config['num_points'], 1) * self.params['Ly']
+            t = torch.rand(gen_config['num_points'], 1) * self.params['T_max']
+            
+        elif generator_type in ['bottom', 'top']:
+            x = torch.rand(gen_config['num_points'], 1) * self.params['Lx']
+            if generator_type == 'bottom':
+                y = torch.zeros(gen_config['num_points'], 1)
+            else:  # top
+                y = torch.full((gen_config['num_points'], 1), self.params['Ly'])
+            t = torch.rand(gen_config['num_points'], 1) * self.params['T_max']
+            
+        elif generator_type in ['left', 'right']:
+            y = torch.rand(gen_config['num_points'], 1) * self.params['Ly']
+            if generator_type == 'left':
+                x = torch.zeros(gen_config['num_points'], 1)
+            else:  # right
+                x = torch.full((gen_config['num_points'], 1), self.params['Lx'])
+            t = torch.rand(gen_config['num_points'], 1) * self.params['T_max']
+            
+        elif generator_type == 'initial':
+            x = torch.rand(gen_config['num_points'], 1) * self.params['Lx']
+            y = torch.rand(gen_config['num_points'], 1) * self.params['Ly']
+            t = torch.full((gen_config['num_points'], 1), gen_config['t_value'])
+            
+        else:
+            raise ValueError(f"Unknown generator type: {generator_type}")
+        
+        return {
+            'x': x.to(self.device),
+            'y': y.to(self.device),
+            't': t.to(self.device)
+        }
+    
+    def train_epoch(self, epoch):
+        """Train for one epoch"""
+        self.model.train()
+        
+        # Generate training points
+        interior_points = self._generate_points('interior')
+        
+        # Compute losses
+        loss_physics, physics_info = compute_physics_loss(self.model, interior_points)
+        loss_bottom = compute_boundary_loss(self.model, 'bottom')
+        loss_top = compute_boundary_loss(self.model, 'top')
+        loss_left = compute_boundary_loss(self.model, 'left')
+        loss_right = compute_boundary_loss(self.model, 'right')
+        loss_sides = loss_left + loss_right
+        loss_initial = compute_initial_loss(self.model)
+        
+        # Get adaptive weights
+        losses_dict = {
+            'physics': loss_physics.item(),
+            'boundary_bottom': loss_bottom.item(),
+            'boundary_top': loss_top.item(),
+            'boundary_sides': loss_sides.item(),
+            'initial': loss_initial.item()
+        }
+        weights = self.loss_weights.update(losses_dict, epoch)
+        
+        # Weighted total loss
+        total_loss = (
+            weights['physics'] * loss_physics +
+            weights['boundary_bottom'] * loss_bottom +
+            weights['boundary_top'] * loss_top +
+            weights['boundary_sides'] * loss_sides +
+            weights['initial'] * loss_initial
         )
         
-        # Optional lookahead optimizer
-        if use_lookahead:
-            self.optimizer = LookaheadOptimizer(base_optimizer)
-        else:
-            self.optimizer = base_optimizer
+        # Backward pass
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), 
+            self.grad_clip_value
+        )
+        
+        # Optimizer step
+        self.optimizer.step()
+        
+        # Update learning rate
+        if epoch % 100 == 0:
+            self.scheduler['cosine'].step()
+        
+        # Record losses
+        self.loss_history['total'].append(total_loss.item())
+        self.loss_history['physics'].append(loss_physics.item())
+        self.loss_history['boundary_bottom'].append(loss_bottom.item())
+        self.loss_history['boundary_top'].append(loss_top.item())
+        self.loss_history['boundary_sides'].append(loss_sides.item())
+        self.loss_history['initial'].append(loss_initial.item())
+        self.loss_history['learning_rate'].append(
+            self.optimizer.param_groups[0]['lr']
+        )
+        
+        return total_loss.item(), physics_info
     
-    def train(self, epochs=5000, batch_size=None, use_mixed_precision=None):
-        """Advanced training loop with optimizations"""
-        if use_mixed_precision is None:
-            use_mixed_precision = self.use_mixed_precision
+    def validate(self):
+        """Run validation"""
+        self.model.eval()
         
-        # Pre-move model and data to device
-        self.model = self.model.to(self.device)
-        if self.experimental_data is not None and isinstance(self.experimental_data, list):
-            # Move experimental data to tensors on device
-            for i, data_point in enumerate(self.experimental_data):
-                if 'time' in data_point:
-                    self.experimental_data[i]['time'] = [float(t) for t in data_point['time']]
-        
-        # Training setup
-        start_time = time.time()
-        epoch_times = []
-        
-        # Training loop
-        for epoch in range(epochs):
-            epoch_start = time.time()
+        with torch.no_grad():
+            # Generate validation points
+            val_points = self._generate_points('interior')
+            val_points['num_points'] = 2000  # Smaller set for validation
             
-            # Zero gradients at the start of each epoch
-            # Handle set_to_none parameter appropriately for different optimizer types
-            if hasattr(self.optimizer, 'set_to_none'):
-                self.optimizer.zero_grad(set_to_none=True)
-            else:
-                self.optimizer.zero_grad()
+            # Compute validation loss
+            val_loss_physics, _ = compute_physics_loss(self.model, val_points)
             
-            # Update adaptive weights
-            self.loss_calculator.update_loss_weights(epoch, epochs)
+            # Check boundary conditions
+            bc_errors = self._check_boundary_conditions()
             
-            # Sample points with adaptive strategy
-            samples = self.adaptive_sampler.sample_domain(
-                model=self.model, 
-                epoch=epoch, 
-                loss_weights=self.loss_calculator.loss_weights
-            )
-            
-            # Compute PDE loss
-            if self.geometry == 'cartesian_2d':
-                x_pde = samples['x'].requires_grad_(True)
-                y_pde = samples['y'].requires_grad_(True)
-                t_pde = samples['t'].requires_grad_(True)
-                
-                pde_loss = self.loss_calculator.compute_pde_loss_cartesian_2d(
-                    self.model, x_pde, y_pde, t_pde, use_mixed_precision
-                )
-            else:  # spherical_1d
-                r_pde = samples['r'].requires_grad_(True)
-                t_pde = samples['t'].requires_grad_(True)
-                
-                pde_loss = self.loss_calculator.compute_pde_loss_spherical_1d(
-                    self.model, r_pde, t_pde, use_mixed_precision
-                )
-            
-            # Sample boundary points
-            bc_samples = self.adaptive_sampler.sample_boundary(num_points=400)
-            bc_loss = self.loss_calculator.compute_boundary_loss(
-                self.model, bc_samples, use_mixed_precision
-            )
-            
-            # Initial condition loss
-            ic_loss = self.loss_calculator.compute_initial_condition_loss(
-                self.model, use_mixed_precision
-            )
-            
-            # Voltage constraint loss
-            voltage_loss = self.loss_calculator.compute_voltage_constraint_loss(
-                self.model, use_mixed_precision
-            )
-            
-            # Experimental data loss
-            data_loss = self.loss_calculator.compute_experimental_data_loss(
-                self.model, self.experimental_data, use_mixed_precision
-            )
-            
-            # Total loss with adaptive weights
-            total_loss = (
-                1.0 * pde_loss +
-                self.loss_weights['bc'] * bc_loss +
-                self.loss_weights['ic'] * ic_loss +
-                self.loss_weights['voltage'] * voltage_loss +
-                self.loss_weights['data'] * data_loss
-            )
-            
-            # Backward pass with mixed precision if available
-            if use_mixed_precision and self.loss_calculator.scaler is not None:
-                self.loss_calculator.scaler.scale(total_loss).backward(retain_graph=False)
-                self.loss_calculator.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.loss_calculator.scaler.step(self.optimizer)
-                self.loss_calculator.scaler.update()
-            else:
-                total_loss.backward(retain_graph=False)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-            
-            # Update learning rate
-            self.scheduler.step(total_loss)
-            
-            # Record history
-            epoch_time = time.time() - epoch_start
-            epoch_times.append(epoch_time)
-            
-            self.history['total_loss'].append(total_loss.item())
-            self.history['pde_loss'].append(pde_loss.item())
-            self.history['bc_loss'].append(bc_loss.item())
-            self.history['ic_loss'].append(ic_loss.item())
-            self.history['voltage_loss'].append(voltage_loss.item() if self.include_voltage else 0.0)
-            self.history['data_loss'].append(data_loss.item())
-            self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-            self.history['training_time'].append(epoch_time)
-            
-            # Checkpointing and early stopping
-            if total_loss.item() < self.best_loss - self.min_delta:
-                self.best_loss = total_loss.item()
-                self.best_model = copy.deepcopy(self.model.state_dict())
-                self.early_stop_counter = 0
-                
-                # Save checkpoint
-                self._save_checkpoint(epoch, total_loss.item())
-            else:
-                self.early_stop_counter += 1
-            
-            # Print progress every 100 epochs
-            if epoch % 100 == 0:
-                print(f"Epoch {epoch}/{epochs}: Total Loss = {total_loss.item():.6e}, "
-                      f"PDE Loss = {pde_loss.item():.6e}, LR = {self.optimizer.param_groups[0]['lr']:.2e}")
-            
-            # Early stopping check
-            if self.early_stop_counter >= self.patience:
-                print(f"Early stopping triggered at epoch {epoch}")
-                break
-        
-        # Finalize training
-        if self.best_model is not None:
-            self.model.load_state_dict(self.best_model)
-        
-        total_training_time = time.time() - start_time
-        self.history['total_training_time'] = total_training_time
-        self.history['avg_epoch_time'] = np.mean(epoch_times)
-        
-        return self.model, self.history
+        return val_loss_physics.item(), bc_errors
     
-    def _save_checkpoint(self, epoch, loss):
-        """Save training checkpoint"""
+    def _check_boundary_conditions(self):
+        """Check boundary condition satisfaction"""
+        errors = {}
+        
+        # Check bottom boundary
+        x = torch.rand(100, 1) * self.params['Lx']
+        y = torch.zeros(100, 1)
+        t = torch.rand(100, 1) * self.params['T_max']
+        
+        with torch.no_grad():
+            c_pred = self.model(x, y, t)
+            errors['bottom_cu'] = torch.mean(
+                torch.abs(c_pred[:, 0] - self.params['C_CU_BOTTOM'])
+            ).item()
+            errors['bottom_ni'] = torch.mean(
+                torch.abs(c_pred[:, 1] - self.params['C_NI_BOTTOM'])
+            ).item()
+            
+            # Check top boundary
+            y = torch.full((100, 1), self.params['Ly'])
+            c_pred = self.model(x, y, t)
+            errors['top_cu'] = torch.mean(
+                torch.abs(c_pred[:, 0] - self.params['C_CU_TOP'])
+            ).item()
+            errors['top_ni'] = torch.mean(
+                torch.abs(c_pred[:, 1] - self.params['C_NI_TOP'])
+            ).item()
+            
+        return errors
+    
+    def save_checkpoint(self, epoch, best=False):
+        """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'loss': loss,
-            'history': self.history,
-            'constants': {
-                k: getattr(self.constants, k)
-                for k in self.constants.__slots__
-                if k != 'device'
-            },
-            'geometry': self.geometry,
-            'include_voltage': self.include_voltage
+            'loss_history': self.loss_history,
+            'config': self.config,
+            'params': self.params
         }
         
-        checkpoint_path = os.path.join(
-            self.checkpoint_dir, 
-            f'checkpoint_epoch_{epoch:04d}_loss_{loss:.6e}.pt'
+        filename = f'checkpoint_epoch_{epoch}.pt'
+        if best:
+            filename = 'best_model.pt'
+            
+        torch.save(checkpoint, os.path.join(self.checkpoint_dir, filename))
+        
+    def train(self, progress_callback=None):
+        """Main training loop"""
+        logger.info(f"Starting training on {self.device}")
+        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        
+        best_val_loss = float('inf')
+        start_time = time.time()
+        
+        for epoch in range(1, self.config['epochs'] + 1):
+            # Train one epoch
+            train_loss, physics_info = self.train_epoch(epoch)
+            
+            # Validation
+            if epoch % self.config['validation_freq'] == 0:
+                val_loss, bc_errors = self.validate()
+                
+                # Update plateau scheduler
+                self.scheduler['plateau'].step(val_loss)
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_checkpoint(epoch, best=True)
+                    
+                # Log validation results
+                log_msg = (f"Epoch {epoch}/{self.config['epochs']}: "
+                          f"Train Loss = {train_loss:.6f}, "
+                          f"Val Loss = {val_loss:.6f}, "
+                          f"LR = {self.optimizer.param_groups[0]['lr']:.2e}")
+                logger.info(log_msg)
+                
+                # Log boundary condition errors
+                for bc, error in bc_errors.items():
+                    logger.info(f"  {bc}: {error:.2e}")
+            
+            # Save checkpoint
+            if epoch % self.config['checkpoint_freq'] == 0:
+                self.save_checkpoint(epoch)
+            
+            # Adaptive sampling update
+            if epoch % self.config['adaptive_sampling_freq'] == 0:
+                # Could update point generators based on physics_info
+                pass
+            
+            # Progress callback for UI
+            if progress_callback:
+                progress_callback(epoch, self.config['epochs'], train_loss)
+        
+        training_time = time.time() - start_time
+        logger.info(f"Training completed in {training_time:.2f} seconds")
+        
+        return self.loss_history
+
+# ============================================================================
+# 6. VISUALIZATION AND ANALYSIS TOOLS
+# ============================================================================
+
+class SolutionAnalyzer:
+    """Comprehensive analysis and visualization of PINN solutions"""
+    
+    def __init__(self, solution_data, params, output_dir):
+        self.solution = solution_data
+        self.params = params
+        self.output_dir = output_dir
+        self.colormaps = {
+            'Cu': 'viridis',
+            'Ni': 'plasma',
+            'residual': 'RdBu_r',
+            'flux': 'coolwarm'
+        }
+        
+    def create_comprehensive_plots(self):
+        """Create all analysis plots"""
+        plots = {}
+        
+        # 1. Concentration profiles
+        plots['concentration_3d'] = self.plot_3d_concentration()
+        plots['concentration_2d'] = self.plot_2d_concentration_grid()
+        plots['concentration_animation'] = self.create_concentration_animation()
+        
+        # 2. Time evolution
+        plots['time_evolution'] = self.plot_time_evolution()
+        plots['boundary_evolution'] = self.plot_boundary_evolution()
+        
+        # 3. Flux analysis
+        plots['flux_distribution'] = self.plot_flux_distribution()
+        plots['mass_conservation'] = self.plot_mass_conservation()
+        
+        # 4. Error analysis
+        plots['error_distribution'] = self.plot_error_distribution()
+        plots['convergence_analysis'] = self.plot_convergence_analysis()
+        
+        # 5. Validation plots
+        plots['boundary_validation'] = self.plot_boundary_validation()
+        plots['pde_residuals'] = self.plot_pde_residuals()
+        
+        return plots
+    
+    def plot_3d_concentration(self):
+        """Create 3D surface plots of concentration"""
+        fig = plt.figure(figsize=(16, 8))
+        
+        # Extract data for final time step
+        t_idx = -1
+        X = self.solution['X']
+        Y = self.solution['Y']
+        c1 = self.solution['c1_preds'][t_idx]
+        c2 = self.solution['c2_preds'][t_idx]
+        
+        # Cu concentration
+        ax1 = fig.add_subplot(121, projection='3d')
+        surf1 = ax1.plot_surface(X, Y, c1, cmap=self.colormaps['Cu'],
+                               linewidth=0, antialiased=True,
+                               rstride=1, cstride=1, alpha=0.8)
+        ax1.set_xlabel('x (μm)')
+        ax1.set_ylabel('y (μm)')
+        ax1.set_zlabel('Cu Concentration (mol/μm³)')
+        ax1.set_title('3D Cu Distribution')
+        fig.colorbar(surf1, ax=ax1, shrink=0.5, aspect=5)
+        
+        # Ni concentration
+        ax2 = fig.add_subplot(122, projection='3d')
+        surf2 = ax2.plot_surface(X, Y, c2, cmap=self.colormaps['Ni'],
+                               linewidth=0, antialiased=True,
+                               rstride=1, cstride=1, alpha=0.8)
+        ax2.set_xlabel('x (μm)')
+        ax2.set_ylabel('y (μm)')
+        ax2.set_zlabel('Ni Concentration (mol/μm³)')
+        ax2.set_title('3D Ni Distribution')
+        fig.colorbar(surf2, ax=ax2, shrink=0.5, aspect=5)
+        
+        plt.suptitle(f'3D Concentration Profiles at t = {self.solution["times"][t_idx]:.1f} s', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        # Save figure
+        filename = os.path.join(self.output_dir, '3d_concentration_profiles.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def plot_2d_concentration_grid(self):
+        """Create 2D grid of concentration profiles at different times"""
+        times = self.solution['times']
+        num_times = min(6, len(times))
+        time_indices = np.linspace(0, len(times)-1, num_times, dtype=int)
+        
+        fig, axes = plt.subplots(num_times, 2, figsize=(14, 4*num_times))
+        
+        for i, t_idx in enumerate(time_indices):
+            t_val = times[t_idx]
+            c1 = self.solution['c1_preds'][t_idx]
+            c2 = self.solution['c2_preds'][t_idx]
+            
+            # Cu concentration
+            im1 = axes[i, 0].imshow(c1, origin='lower', 
+                                   extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                                   cmap=self.colormaps['Cu'],
+                                   vmin=0, vmax=self.params['C_CU_TOP'])
+            axes[i, 0].set_title(f'Cu at t = {t_val:.1f} s')
+            axes[i, 0].set_xlabel('x (μm)')
+            axes[i, 0].set_ylabel('y (μm)')
+            plt.colorbar(im1, ax=axes[i, 0])
+            
+            # Ni concentration
+            im2 = axes[i, 1].imshow(c2, origin='lower',
+                                   extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                                   cmap=self.colormaps['Ni'],
+                                   vmin=0, vmax=self.params['C_NI_BOTTOM'])
+            axes[i, 1].set_title(f'Ni at t = {t_val:.1f} s')
+            axes[i, 1].set_xlabel('x (μm)')
+            axes[i, 1].set_ylabel('y (μm)')
+            plt.colorbar(im2, ax=axes[i, 1])
+        
+        plt.suptitle('Time Evolution of Concentration Profiles', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        filename = os.path.join(self.output_dir, '2d_concentration_grid.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def plot_time_evolution(self):
+        """Plot concentration evolution at specific points"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Select observation points
+        points = [
+            (self.params['Lx']/2, self.params['Ly']/2, 'Center'),
+            (self.params['Lx']/2, 0, 'Bottom Center'),
+            (self.params['Lx']/2, self.params['Ly'], 'Top Center'),
+            (0, self.params['Ly']/2, 'Left Center')
+        ]
+        
+        times = np.array(self.solution['times'])
+        
+        for idx, (x_pos, y_pos, label) in enumerate(points):
+            ax = axes[idx // 2, idx % 2]
+            
+            # Find nearest grid point
+            x_idx = np.argmin(np.abs(self.solution['X'][0, :] - x_pos))
+            y_idx = np.argmin(np.abs(self.solution['Y'][:, 0] - y_pos))
+            
+            # Extract time evolution
+            c1_vals = [c[y_idx, x_idx] for c in self.solution['c1_preds']]
+            c2_vals = [c[y_idx, x_idx] for c in self.solution['c2_preds']]
+            
+            # Plot
+            ax.plot(times, c1_vals, 'b-', linewidth=2, label='Cu')
+            ax.plot(times, c2_vals, 'r-', linewidth=2, label='Ni')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Concentration (mol/μm³)')
+            ax.set_title(f'Evolution at {label}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Add theoretical prediction (simplified 1D diffusion)
+            if label == 'Center':
+                # Simplified analytical solution for diffusion from boundaries
+                D_eff = (self.params['D11'] + self.params['D22']) / 2
+                c_theory = self.params['C_CU_TOP'] * 0.5 * (1 - np.exp(-D_eff * times / (self.params['Ly']**2)))
+                ax.plot(times, c_theory, 'g--', linewidth=1.5, label='Theoretical (approx)')
+                ax.legend()
+        
+        plt.suptitle('Concentration Time Evolution at Observation Points', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        filename = os.path.join(self.output_dir, 'time_evolution.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def plot_flux_distribution(self):
+        """Calculate and plot flux distributions"""
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Compute gradients (approximate)
+        c1_final = self.solution['c1_preds'][-1]
+        c2_final = self.solution['c2_preds'][-1]
+        
+        # Compute gradients using finite differences
+        dx = self.params['Lx'] / (c1_final.shape[1] - 1)
+        dy = self.params['Ly'] / (c1_final.shape[0] - 1)
+        
+        # Flux components (Fick's first law)
+        flux_cu_x = -self.params['D11'] * np.gradient(c1_final, dx, axis=1)
+        flux_cu_y = -self.params['D11'] * np.gradient(c1_final, dy, axis=0)
+        
+        flux_ni_x = -self.params['D22'] * np.gradient(c2_final, dx, axis=1)
+        flux_ni_y = -self.params['D22'] * np.gradient(c2_final, dy, axis=0)
+        
+        # Magnitude of total flux
+        flux_magnitude_cu = np.sqrt(flux_cu_x**2 + flux_cu_y**2)
+        flux_magnitude_ni = np.sqrt(flux_ni_x**2 + flux_ni_y**2)
+        
+        # Plot flux magnitude
+        im1 = axes[0].imshow(flux_magnitude_cu, origin='lower',
+                            extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                            cmap=self.colormaps['flux'])
+        axes[0].set_title('Cu Flux Magnitude')
+        axes[0].set_xlabel('x (μm)')
+        axes[0].set_ylabel('y (μm)')
+        plt.colorbar(im1, ax=axes[0], label='Flux magnitude')
+        
+        im2 = axes[1].imshow(flux_magnitude_ni, origin='lower',
+                            extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                            cmap=self.colormaps['flux'])
+        axes[1].set_title('Ni Flux Magnitude')
+        axes[1].set_xlabel('x (μm)')
+        axes[1].set_ylabel('y (μm)')
+        plt.colorbar(im2, ax=axes[1], label='Flux magnitude')
+        
+        # Add streamlines to show flux direction
+        Y, X = np.mgrid[0:self.params['Ly']:c1_final.shape[0]*1j,
+                       0:self.params['Lx']:c1_final.shape[1]*1j]
+        axes[0].streamplot(X, Y, flux_cu_x, flux_cu_y, color='white', 
+                          linewidth=0.5, density=1.5)
+        axes[1].streamplot(X, Y, flux_ni_x, flux_ni_y, color='white',
+                          linewidth=0.5, density=1.5)
+        
+        plt.suptitle('Flux Distribution at Final Time', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        filename = os.path.join(self.output_dir, 'flux_distribution.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def plot_mass_conservation(self):
+        """Check and plot mass conservation"""
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        times = np.array(self.solution['times'])
+        total_mass_cu = []
+        total_mass_ni = []
+        
+        # Approximate integration of mass
+        dx = self.params['Lx'] / (self.solution['c1_preds'][0].shape[1] - 1)
+        dy = self.params['Ly'] / (self.solution['c1_preds'][0].shape[0] - 1)
+        area_element = dx * dy
+        
+        for t_idx in range(len(times)):
+            c1 = self.solution['c1_preds'][t_idx]
+            c2 = self.solution['c2_preds'][t_idx]
+            
+            mass_cu = np.sum(c1) * area_element
+            mass_ni = np.sum(c2) * area_element
+            
+            total_mass_cu.append(mass_cu)
+            total_mass_ni.append(mass_ni)
+        
+        # Plot mass evolution
+        axes[0].plot(times, total_mass_cu, 'b-', linewidth=2, label='Total Cu Mass')
+        axes[0].plot(times, total_mass_ni, 'r-', linewidth=2, label='Total Ni Mass')
+        axes[0].set_xlabel('Time (s)')
+        axes[0].set_ylabel('Total Mass (mol)')
+        axes[0].set_title('Mass Evolution')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot mass conservation error
+        initial_mass_cu = total_mass_cu[0]
+        initial_mass_ni = total_mass_ni[0]
+        
+        mass_error_cu = np.abs((np.array(total_mass_cu) - initial_mass_cu) / (initial_mass_cu + 1e-10))
+        mass_error_ni = np.abs((np.array(total_mass_ni) - initial_mass_ni) / (initial_mass_ni + 1e-10))
+        
+        axes[1].semilogy(times, mass_error_cu, 'b--', linewidth=2, label='Cu Mass Error')
+        axes[1].semilogy(times, mass_error_ni, 'r--', linewidth=2, label='Ni Mass Error')
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Relative Mass Error')
+        axes[1].set_title('Mass Conservation Error')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3, which='both')
+        
+        plt.suptitle('Mass Conservation Analysis', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        filename = os.path.join(self.output_dir, 'mass_conservation.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def plot_boundary_validation(self):
+        """Validate boundary condition satisfaction"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        times = np.array(self.solution['times'])
+        
+        # Extract boundary profiles
+        # Bottom boundary (y=0)
+        bottom_cu = [c[0, :] for c in self.solution['c1_preds']]
+        bottom_ni = [c[0, :] for c in self.solution['c2_preds']]
+        
+        # Top boundary (y=Ly)
+        top_cu = [c[-1, :] for c in self.solution['c1_preds']]
+        top_ni = [c[-1, :] for c in self.solution['c2_preds']]
+        
+        # Left boundary (x=0)
+        left_cu = [c[:, 0] for c in self.solution['c1_preds']]
+        left_ni = [c[:, 0] for c in self.solution['c2_preds']]
+        
+        # Right boundary (x=Lx)
+        right_cu = [c[:, -1] for c in self.solution['c1_preds']]
+        right_ni = [c[:, -1] for c in self.solution['c2_preds']]
+        
+        # Plot bottom boundary
+        x_coords = np.linspace(0, self.params['Lx'], len(bottom_cu[0]))
+        for i, t_idx in enumerate([0, len(times)//2, -1]):
+            t_val = times[t_idx]
+            axes[0, 0].plot(x_coords, bottom_cu[t_idx], 
+                           label=f't={t_val:.1f}s', linewidth=2)
+        axes[0, 0].axhline(y=self.params['C_CU_BOTTOM'], color='r', 
+                          linestyle='--', linewidth=2, label='Target')
+        axes[0, 0].set_xlabel('x (μm)')
+        axes[0, 0].set_ylabel('Cu Concentration')
+        axes[0, 0].set_title('Bottom Boundary (Cu)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot top boundary
+        for i, t_idx in enumerate([0, len(times)//2, -1]):
+            t_val = times[t_idx]
+            axes[0, 1].plot(x_coords, top_cu[t_idx], 
+                           label=f't={t_val:.1f}s', linewidth=2)
+        axes[0, 1].axhline(y=self.params['C_CU_TOP'], color='r',
+                          linestyle='--', linewidth=2, label='Target')
+        axes[0, 1].set_xlabel('x (μm)')
+        axes[0, 1].set_ylabel('Cu Concentration')
+        axes[0, 1].set_title('Top Boundary (Cu)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot left boundary flux
+        y_coords = np.linspace(0, self.params['Ly'], len(left_cu[0]))
+        for i, t_idx in enumerate([0, len(times)//2, -1]):
+            t_val = times[t_idx]
+            # Compute derivative (approximate)
+            flux = np.gradient(left_cu[t_idx], y_coords)
+            axes[1, 0].plot(y_coords, flux, label=f't={t_val:.1f}s', linewidth=2)
+        axes[1, 0].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Zero Flux')
+        axes[1, 0].set_xlabel('y (μm)')
+        axes[1, 0].set_ylabel('Flux (∂c/∂x)')
+        axes[1, 0].set_title('Left Boundary Flux (Cu)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot right boundary flux
+        for i, t_idx in enumerate([0, len(times)//2, -1]):
+            t_val = times[t_idx]
+            flux = np.gradient(right_cu[t_idx], y_coords)
+            axes[1, 1].plot(y_coords, flux, label=f't={t_val:.1f}s', linewidth=2)
+        axes[1, 1].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Zero Flux')
+        axes[1, 1].set_xlabel('y (μm)')
+        axes[1, 1].set_ylabel('Flux (∂c/∂x)')
+        axes[1, 1].set_title('Right Boundary Flux (Cu)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.suptitle('Boundary Condition Validation', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        filename = os.path.join(self.output_dir, 'boundary_validation.png')
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return filename
+    
+    def create_concentration_animation(self):
+        """Create animated GIF of concentration evolution"""
+        from matplotlib.animation import FuncAnimation, PillowWriter
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Initial plots
+        im1 = ax1.imshow(self.solution['c1_preds'][0], origin='lower',
+                        extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                        cmap=self.colormaps['Cu'], vmin=0, vmax=self.params['C_CU_TOP'])
+        ax1.set_title('Cu Concentration')
+        ax1.set_xlabel('x (μm)')
+        ax1.set_ylabel('y (μm)')
+        plt.colorbar(im1, ax=ax1)
+        
+        im2 = ax2.imshow(self.solution['c2_preds'][0], origin='lower',
+                        extent=[0, self.params['Lx'], 0, self.params['Ly']],
+                        cmap=self.colormaps['Ni'], vmin=0, vmax=self.params['C_NI_BOTTOM'])
+        ax2.set_title('Ni Concentration')
+        ax2.set_xlabel('x (μm)')
+        ax2.set_ylabel('y (μm)')
+        plt.colorbar(im2, ax=ax2)
+        
+        time_text = fig.suptitle(f'Time = {self.solution["times"][0]:.1f} s', 
+                                fontsize=14, fontweight='bold')
+        
+        def update(frame):
+            im1.set_array(self.solution['c1_preds'][frame])
+            im2.set_array(self.solution['c2_preds'][frame])
+            time_text.set_text(f'Time = {self.solution["times"][frame]:.1f} s')
+            return im1, im2, time_text
+        
+        # Create animation
+        ani = FuncAnimation(fig, update, frames=len(self.solution['times']),
+                          interval=100, blit=True)
+        
+        # Save as GIF
+        filename = os.path.join(self.output_dir, 'concentration_evolution.gif')
+        ani.save(filename, writer=PillowWriter(fps=10))
+        plt.close()
+        
+        return filename
+
+# ============================================================================
+# 7. VTK/VTU EXPORT WITH ENHANCED FEATURES
+# ============================================================================
+
+class VTKExporter:
+    """Export solution to VTK formats for visualization in ParaView"""
+    
+    def __init__(self, solution_data, params, output_dir):
+        self.solution = solution_data
+        self.params = params
+        self.output_dir = output_dir
+        
+    def export_time_series_vts(self):
+        """Export time series as VTS files (structured grid)"""
+        vts_files = []
+        
+        # Create output directory
+        vts_dir = os.path.join(self.output_dir, 'vts_files')
+        os.makedirs(vts_dir, exist_ok=True)
+        
+        # Grid dimensions
+        nx, ny = self.solution['X'].shape[1], self.solution['X'].shape[0]
+        
+        for t_idx, t_val in enumerate(self.solution['times']):
+            # Create structured grid
+            grid = pv.StructuredGrid()
+            
+            # Set points (reshape to 3D with z=0)
+            x = self.solution['X'].flatten()
+            y = self.solution['Y'].flatten()
+            z = np.zeros_like(x)
+            points = np.column_stack([x, y, z])
+            grid.points = points
+            grid.dimensions = [nx, ny, 1]
+            
+            # Add concentration data
+            grid.point_data['Cu_Concentration'] = self.solution['c1_preds'][t_idx].T.flatten()
+            grid.point_data['Ni_Concentration'] = self.solution['c2_preds'][t_idx].T.flatten()
+            
+            # Compute derived quantities
+            total_concentration = (self.solution['c1_preds'][t_idx] + 
+                                 self.solution['c2_preds'][t_idx]).T.flatten()
+            grid.point_data['Total_Concentration'] = total_concentration
+            
+            # Compute concentration ratio
+            with np.errstate(divide='ignore', invalid='ignore'):
+                concentration_ratio = np.where(
+                    self.solution['c2_preds'][t_idx] > 1e-10,
+                    self.solution['c1_preds'][t_idx] / self.solution['c2_preds'][t_idx],
+                    0.0
+                )
+            grid.point_data['Cu_Ni_Ratio'] = concentration_ratio.T.flatten()
+            
+            # Save VTS file
+            vts_filename = os.path.join(vts_dir, f'concentration_t_{t_val:06.1f}.vts')
+            grid.save(vts_filename)
+            vts_files.append((t_val, vts_filename))
+            
+        logger.info(f"Exported {len(vts_files)} VTS files to {vts_dir}")
+        return vts_files
+    
+    def export_single_vtu(self):
+        """Export all time steps to a single VTU file with time arrays"""
+        # Create unstructured grid
+        nx, ny = self.solution['X'].shape[1], self.solution['X'].shape[0]
+        
+        # Create points (2D grid)
+        x = self.solution['X'].flatten()
+        y = self.solution['Y'].flatten()
+        z = np.zeros_like(x)
+        points = np.column_stack([x, y, z])
+        
+        # Create cells (quads)
+        cells = []
+        cell_types = []
+        
+        for j in range(ny - 1):
+            for i in range(nx - 1):
+                idx = i + j * nx
+                cell = [4, idx, idx + 1, idx + nx + 1, idx + nx]
+                cells.extend(cell)
+                cell_types.append(pv.CellType.QUAD)
+        
+        grid = pv.UnstructuredGrid(cells, cell_types, points)
+        
+        # Add concentration data for all time steps
+        times = self.solution['times']
+        for t_idx, t_val in enumerate(times):
+            grid.point_data[f'Cu_Concentration_t{t_val:.1f}'] = \
+                self.solution['c1_preds'][t_idx].T.flatten()
+            grid.point_data[f'Ni_Concentration_t{t_val:.1f}'] = \
+                self.solution['c2_preds'][t_idx].T.flatten()
+        
+        # Add time array
+        grid.point_data['Time'] = np.full(len(points), times[-1])
+        
+        # Save VTU file
+        vtu_filename = os.path.join(self.output_dir, 'concentration_all_times.vtu')
+        grid.save(vtu_filename)
+        
+        logger.info(f"Exported single VTU file: {vtu_filename}")
+        return vtu_filename
+    
+    def create_pvd_collection(self, vts_files):
+        """Create PVD file for time series visualization in ParaView"""
+        pvd_content = ['<?xml version="1.0"?>',
+                      '<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">',
+                      '  <Collection>']
+        
+        for t_val, vts_file in vts_files:
+            rel_path = os.path.relpath(vts_file, self.output_dir)
+            pvd_content.append(f'    <DataSet timestep="{t_val:.1f}" part="0" file="{rel_path}"/>')
+        
+        pvd_content.append('  </Collection>')
+        pvd_content.append('</VTKFile>')
+        
+        pvd_filename = os.path.join(self.output_dir, 'concentration_time_series.pvd')
+        with open(pvd_filename, 'w') as f:
+            f.write('\n'.join(pvd_content))
+        
+        logger.info(f"Created PVD collection: {pvd_filename}")
+        return pvd_filename
+    
+    def export_for_paraview_state(self):
+        """Create comprehensive export for ParaView state file"""
+        # Export all formats
+        vts_files = self.export_time_series_vts()
+        vtu_file = self.export_single_vtu()
+        pvd_file = self.create_pvd_collection(vts_files)
+        
+        # Create metadata file
+        metadata = {
+            'parameters': self.params,
+            'grid_info': {
+                'nx': self.solution['X'].shape[1],
+                'ny': self.solution['X'].shape[0],
+                'num_timesteps': len(self.solution['times'])
+            },
+            'files': {
+                'vts_files': [f[1] for f in vts_files],
+                'vtu_file': vtu_file,
+                'pvd_file': pvd_file
+            },
+            'export_time': datetime.now().isoformat()
+        }
+        
+        metadata_file = os.path.join(self.output_dir, 'export_metadata.json')
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {
+            'vts_files': vts_files,
+            'vtu_file': vtu_file,
+            'pvd_file': pvd_file,
+            'metadata_file': metadata_file
+        }
+
+# ============================================================================
+# 8. STREAMLIT UI WITH ADVANCED CONTROLS
+# ============================================================================
+
+class PINNStreamlitApp:
+    """Streamlit application for interactive PINN simulation"""
+    
+    def __init__(self):
+        self.setup_page()
+        self.initialize_session_state()
+        
+    def setup_page(self):
+        """Configure Streamlit page"""
+        st.set_page_config(
+            page_title="2D PINN Simulation: Cu-Ni Cross-Diffusion",
+            page_icon="🔬",
+            layout="wide",
+            initial_sidebar_state="expanded"
         )
         
-        torch.save(checkpoint, checkpoint_path)
-        return checkpoint_path
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Load training checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # Custom CSS
+        st.markdown("""
+        <style>
+        .main-header {
+            font-size: 2.5rem;
+            color: #1E3A8A;
+            text-align: center;
+            padding: 1rem;
+        }
+        .sub-header {
+            font-size: 1.5rem;
+            color: #374151;
+            margin-top: 1rem;
+        }
+        .info-box {
+            background-color: #F0F9FF;
+            border-left: 4px solid #3B82F6;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 0.5rem;
+        }
+        .success-box {
+            background-color: #D1FAE5;
+            border-left: 4px solid #10B981;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 0.5rem;
+        }
+        .warning-box {
+            background-color: #FEF3C7;
+            border-left: 4px solid #F59E0B;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 0.5rem;
+        }
+        </style>
+        """, unsafe_allow_html=True)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.history = checkpoint['history']
+        # Header
+        st.markdown('<h1 class="main-header">🔬 2D PINN Simulation: Cu-Ni Cross-Diffusion</h1>', 
+                   unsafe_allow_html=True)
         
-        return self.model, self.history
-
-# =====================================================
-# LOOKAHEAD OPTIMIZER IMPLEMENTATION
-# =====================================================
-class LookaheadOptimizer:
-    """Lookahead optimizer implementation for better convergence"""
-    def __init__(self, base_optimizer, k=5, alpha=0.5):
-        self.base_optimizer = base_optimizer
-        self.k = k
-        self.alpha = alpha
-        self.step_counter = 0
+        # Description
+        st.markdown("""
+        <div class="info-box">
+        <h3>📖 About this Simulation</h3>
+        <p>This Physics-Informed Neural Network (PINN) solves coupled cross-diffusion equations 
+        for Copper (Cu) and Nickel (Ni) in a 2D domain with time evolution. The model enforces 
+        physics constraints, boundary conditions, and initial conditions through a combined loss function.</p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Save fast weights
-        self.param_groups_backup = []
-        for group in base_optimizer.param_groups:
-            group_backup = {}
-            for p in group['params']:
-                if p.requires_grad:
-                    group_backup[p] = p.data.clone().detach()
-            self.param_groups_backup.append(group_backup)
-        
-        # Copy param_groups from base optimizer
-        self.param_groups = base_optimizer.param_groups
-    
-    def step(self):
-        """Perform optimization step"""
-        self.base_optimizer.step()
-        self.step_counter += 1
-        
-        # Update slow weights periodically
-        if self.step_counter >= self.k:
-            for group_idx, group in enumerate(self.base_optimizer.param_groups):
-                backup = self.param_groups_backup[group_idx]
-                for p in group['params']:
-                    if p.requires_grad and p in backup:
-                        # Slow update: θ = θ + α(φ - θ)
-                        backup[p].add_(self.alpha * (p.data - backup[p]))
-                        # Copy back to fast weights
-                        p.data.copy_(backup[p])
-            self.step_counter = 0
-    
-    def zero_grad(self, set_to_none=None):
-        """Zero the gradients of optimized parameters"""
-        # Pass set_to_none parameter if base optimizer supports it
-        if set_to_none is not None:
-            # Try to call with set_to_none if supported
-            try:
-                self.base_optimizer.zero_grad(set_to_none=set_to_none)
-            except TypeError:
-                # Fall back to regular zero_grad if set_to_none not supported
-                self.base_optimizer.zero_grad()
-        else:
-            self.base_optimizer.zero_grad()
-    
-    def state_dict(self):
-        """Get optimizer state dictionary"""
-        return self.base_optimizer.state_dict()
-    
-    def load_state_dict(self, state_dict):
-        """Load optimizer state dictionary"""
-        self.base_optimizer.load_state_dict(state_dict)
-
-# =====================================================
-# OPTIMIZED TRAINING FUNCTION
-# =====================================================
-def train_pinn_model_optimized(constants, geometry='cartesian_2d', include_voltage=True,
-                              experimental_data=None, epochs=5000, lr=1e-3,
-                              device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    Optimized PINN training function with all performance improvements
-    
-    Args:
-        constants: PhysicalConstants object
-        geometry: 'cartesian_2d' or 'spherical_1d'
-        include_voltage: Whether to include voltage prediction
-        experimental_ List of experimental data points
-        epochs: Maximum number of training epochs
-        lr: Initial learning rate
-        device: Device to train on ('cpu' or 'cuda')
-        
-    Returns:
-        Trained model and training history
-    """
-    # Validate device
-    if device is None:
-        device = 'cpu'
-    elif isinstance(device, str):
-        if device == 'cuda' and not torch.cuda.is_available():
-            st.warning("CUDA requested but not available. Falling back to CPU.")
-            device = 'cpu'
-    
-    # Move constants to device
-    constants = constants.to(device)
-    
-    # Initialize model
-    model = AdaptivePINN(
-        constants, 
-        geometry=geometry,
-        include_voltage=include_voltage,
-        hidden_dim=128,
-        num_layers=4,
-        use_fourier_features=True
-    ).to(device)
-    
-    # Initialize weights
-    model.initialize_weights()
-    
-    # Setup training manager
-    trainer = TrainingManager(
-        model=model,
-        constants=constants,
-        geometry=geometry,
-        include_voltage=include_voltage,
-        experimental_data=experimental_data,
-        device=device,
-        checkpoint_dir=f"checkpoints_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    )
-    
-    # Setup optimizer
-    trainer.setup_optimizer(
-        lr=lr,
-        weight_decay=1e-5,
-        use_lookahead=True
-    )
-    
-    # Train model
-    model, history = trainer.train(
-        epochs=epochs,
-        use_mixed_precision=(device == 'cuda')
-    )
-    
-    return model, history
-
-# =====================================================
-# OPTIMIZED VISUALIZATION FUNCTIONS
-# =====================================================
-def plot_loss_history_optimized(history):
-    """Optimized plotting of training loss history"""
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), dpi=100)
-    axes = axes.flatten()
-    
-    loss_types = ['total_loss', 'pde_loss', 'bc_loss', 'ic_loss', 'voltage_loss', 'data_loss']
-    titles = ['Total Loss', 'PDE Loss', 'BC Loss', 'IC Loss', 'Voltage Loss', 'Data Loss']
-    
-    for idx, (loss_type, title) in enumerate(zip(loss_types, titles)):
-        if loss_type in history and len(history[loss_type]) > 0:
-            axes[idx].semilogy(history[loss_type], 'b-', linewidth=2, alpha=0.8)
-            axes[idx].set_title(title, fontsize=12, fontweight='bold')
-            axes[idx].set_xlabel('Epoch', fontsize=10)
-            axes[idx].set_ylabel('Loss', fontsize=10)
-            axes[idx].grid(True, alpha=0.3)
+    def initialize_session_state(self):
+        """Initialize session state variables"""
+        if 'training_complete' not in st.session_state:
+            st.session_state.training_complete = False
+        if 'solution_data' not in st.session_state:
+            st.session_state.solution_data = None
+        if 'model' not in st.session_state:
+            st.session_state.model = None
+        if 'loss_history' not in st.session_state:
+            st.session_state.loss_history = None
+        if 'analysis_plots' not in st.session_state:
+            st.session_state.analysis_plots = {}
+        if 'export_files' not in st.session_state:
+            st.session_state.export_files = {}
+        if 'training_progress' not in st.session_state:
+            st.session_state.training_progress = 0
             
-            # Add annotation for minimum loss
-            min_idx = np.argmin(history[loss_type])
-            min_val = history[loss_type][min_idx]
-            axes[idx].annotate(f'Min: {min_val:.2e}\nEpoch: {min_idx}',
-                             xy=(min_idx, min_val),
-                             xytext=(0.95, 0.95),
-                             textcoords='axes fraction',
-                             ha='right', va='top',
-                             bbox=dict(boxstyle='round,pad=0.3', fc='yellow', alpha=0.3),
-                             arrowprops=dict(arrowstyle='->'))
-    
-    plt.tight_layout()
-    return fig
-
-def plot_concentration_profile_2d_optimized(model, constants, t_value, resolution=100):
-    """Optimized 2D concentration profile plotting"""
-    # Create grid with proper resolution
-    x = torch.linspace(0, constants.Lx, resolution, device=constants.device, dtype=torch.float32)
-    y = torch.linspace(0, constants.Ly, resolution, device=constants.device, dtype=torch.float32)
-    X, Y = torch.meshgrid(x, y, indexing='ij')
-    
-    # Batch prediction for memory efficiency
-    batch_size = 10000
-    total_points = resolution * resolution
-    c_pred_all = torch.zeros(total_points, device=constants.device, dtype=torch.float32)
-    
-    with torch.no_grad():
-        for i in range(0, total_points, batch_size):
-            end_idx = min(i + batch_size, total_points)
-            X_flat = X.reshape(-1, 1)[i:end_idx]
-            Y_flat = Y.reshape(-1, 1)[i:end_idx]
-            t_flat = torch.full_like(X_flat, t_value)
+    def create_sidebar_controls(self):
+        """Create sidebar controls for simulation parameters"""
+        with st.sidebar:
+            st.markdown("## ⚙️ Simulation Parameters")
             
-            outputs = model(X_flat, Y_flat, t_flat)
-            c_pred_all[i:end_idx] = outputs['c'].squeeze()
-    
-    c_pred = c_pred_all.reshape(resolution, resolution).cpu().numpy()
-    
-    # Create custom colormap
-    colors = [(0.8, 0.1, 0.1), (0.9, 0.9, 0.1), (0.1, 0.5, 0.8)]  # Red -> Yellow -> Blue
-    cmap = LinearSegmentedColormap.from_list('lifepo4', colors, N=256)
-    
-    # Create figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), dpi=120)
-    
-    # 2D contour plot with phase boundaries
-    im1 = ax1.imshow(c_pred.T, extent=[0, constants.Lx*1e9, 0, constants.Ly*1e9],
-                    origin='lower', cmap=cmap, aspect='auto', vmin=0, vmax=1)
-    
-    # Add phase boundaries
-    contour_levels = [constants.c_alpha, (constants.c_alpha + constants.c_beta)/2, constants.c_beta]
-    contour_colors = ['white', 'gray', 'black']
-    CS = ax1.contour(c_pred.T, levels=contour_levels, colors=contour_colors, 
-                    linewidths=1.5, alpha=0.8, extent=[0, constants.Lx*1e9, 0, constants.Ly*1e9])
-    ax1.clabel(CS, fmt={constants.c_alpha: 'FePO₄', (constants.c_alpha + constants.c_beta)/2: 'Interface', 
-                        constants.c_beta: 'LiFePO₄'}, fontsize=8)
-    
-    ax1.set_xlabel('x (nm)', fontsize=10)
-    ax1.set_ylabel('y (nm)', fontsize=10)
-    ax1.set_title(f'Li Concentration Field at t = {t_value:.1f} s', fontsize=12, fontweight='bold')
-    cbar1 = plt.colorbar(im1, ax=ax1, label='Li Content (x in LiₓFePO₄)')
-    cbar1.ax.tick_params(labelsize=8)
-    
-    # Line profile at center
-    y_mid_idx = resolution // 2
-    ax2.plot(x.cpu().numpy()*1e9, c_pred[:, y_mid_idx], 'b-', linewidth=2.5, label='PINN Prediction')
-    
-    # Add equilibrium phase compositions
-    ax2.axhline(constants.c_alpha, color='r', linestyle='--', linewidth=1.5, alpha=0.7, label='FePO₄ Phase')
-    ax2.axhline(constants.c_beta, color='g', linestyle='--', linewidth=1.5, alpha=0.7, label='LiFePO₄ Phase')
-    
-    ax2.set_xlabel('x (nm)', fontsize=10)
-    ax2.set_ylabel('Li Concentration (x)', fontsize=10)
-    ax2.set_title('Concentration Profile at y = L/2', fontsize=12, fontweight='bold')
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(-0.05, 1.05)
-    
-    plt.tight_layout()
-    return fig
-
-def plot_spherical_profile_optimized(model, constants, t_values):
-    """Optimized spherical profile plotting"""
-    fig, axes = plt.subplots(1, len(t_values), figsize=(5*len(t_values), 4), dpi=100)
-    if len(t_values) == 1:
-        axes = [axes]
-    
-    r = torch.linspace(0, constants.particle_radius, 200, device=constants.device, dtype=torch.float32).reshape(-1, 1)
-    
-    # Precompute theoretical interface position for comparison
-    interface_position = 0.5 * constants.particle_radius  # Simplified estimate
-    
-    for idx, t_val in enumerate(t_values):
-        t_tensor = torch.full_like(r, t_val)
-        
-        with torch.no_grad():
-            outputs = model(r, t_tensor)
-            c_pred = outputs['c'].cpu().numpy().flatten()
-            
-            if model.include_voltage and 'V' in outputs:
-                V_pred = outputs['V'].mean().cpu().item()
-            else:
-                V_pred = None
-        
-        ax = axes[idx]
-        
-        # Plot concentration profile
-        ax.plot(r.cpu().numpy().flatten()*1e9, c_pred, 'b-', linewidth=2.5, label='PINN Prediction')
-        
-        # Add phase boundaries
-        ax.axhline(constants.c_alpha, color='r', linestyle='--', linewidth=1.5, alpha=0.7, label='FePO₄ (c_α)')
-        ax.axhline(constants.c_beta, color='g', linestyle='--', linewidth=1.5, alpha=0.7, label='LiFePO₄ (c_β)')
-        
-        # Highlight interface region
-        interface_mask = (c_pred > constants.c_alpha) & (c_pred < constants.c_beta)
-        if np.any(interface_mask):
-            interface_r = r.cpu().numpy().flatten()[interface_mask]
-            if len(interface_r) > 0:
-                ax.axvspan(interface_r[0]*1e9, interface_r[-1]*1e9, alpha=0.2, color='yellow', label='Interface')
-        
-        ax.set_xlabel('Radius (nm)', fontsize=10)
-        ax.set_ylabel('Li Concentration (x)', fontsize=10)
-        title = f't = {t_val:.1f} s'
-        if V_pred is not None:
-            title += f', V = {V_pred:.3f} V'
-        ax.set_title(title, fontsize=12, fontweight='bold')
-        
-        ax.set_ylim(-0.05, 1.05)
-        ax.grid(True, alpha=0.3)
-        
-        # Add legend only to first plot
-        if idx == 0:
-            ax.legend(fontsize=9, loc='best')
-    
-    plt.tight_layout()
-    return fig
-
-def plot_voltage_profile_optimized(model, constants, geometry='cartesian_2d'):
-    """Optimized voltage profile plotting"""
-    t_values = torch.linspace(0, constants.T_max, 200, device=constants.device, dtype=torch.float32).reshape(-1, 1)
-    
-    V_pred = np.zeros(len(t_values))
-    V_eq = np.zeros(len(t_values))
-    
-    # Batch processing for memory efficiency
-    batch_size = 50
-    with torch.no_grad():
-        for i in range(0, len(t_values), batch_size):
-            end_idx = min(i + batch_size, len(t_values))
-            t_batch = t_values[i:end_idx]
-            
-            if geometry == 'cartesian_2d':
-                # Sample multiple points for spatial averaging
-                x_samples = torch.linspace(0, constants.Lx, 5, device=constants.device, dtype=torch.float32)
-                y_samples = torch.linspace(0, constants.Ly, 5, device=constants.device, dtype=torch.float32)
-                X, Y = torch.meshgrid(x_samples, y_samples, indexing='ij')
+            # Physical parameters
+            with st.expander("🔬 Physical Parameters", expanded=True):
+                st.markdown("**Diffusion Coefficients (μm²/s)**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    D11 = st.number_input("D₁₁ (Cu self-diffusion)", 
+                                        value=PhysicalParameters.D11, 
+                                        format="%.5f")
+                    D12 = st.number_input("D₁₂ (Cu-Ni cross)", 
+                                        value=PhysicalParameters.D12, 
+                                        format="%.5f")
+                with col2:
+                    D21 = st.number_input("D₂₁ (Ni-Cu cross)", 
+                                        value=PhysicalParameters.D21, 
+                                        format="%.5f")
+                    D22 = st.number_input("D₂₂ (Ni self-diffusion)", 
+                                        value=PhysicalParameters.D22, 
+                                        format="%.5f")
                 
-                V_batch_total = 0
-                mu_batch_total = 0
-                count = 0
+                st.markdown("**Domain Dimensions (μm)**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    Lx = st.number_input("Width (Lx)", value=PhysicalParameters.Lx)
+                with col2:
+                    Ly = st.number_input("Height (Ly)", value=PhysicalParameters.Ly)
                 
-                for xi in range(5):
-                    for yi in range(5):
-                        x_batch = X[xi, yi].view(1,1).expand(len(t_batch), 1)
-                        y_batch = Y[xi, yi].view(1,1).expand(len(t_batch), 1)
-                        outputs = model(x_batch, y_batch, t_batch)
-                        
-                        if 'V' in outputs:
-                            V_batch_total += outputs['V'].squeeze()
-                        mu_batch_total += outputs['mu'].squeeze()
-                        count += 1
+                st.markdown("**Time Parameters**")
+                T_max = st.number_input("Maximum Time (s)", value=PhysicalParameters.T_max)
                 
-                if 'V' in outputs:
-                    V_pred[i:end_idx] = (V_batch_total / count).cpu().numpy()
-                V_eq[i:end_idx] = (constants.V0 - (1/constants.F) * (mu_batch_total / count)).cpu().numpy()
+                st.markdown("**Boundary Concentrations (mol/μm³)**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    C_CU_TOP = st.number_input("Top: Cu", value=PhysicalParameters.C_CU_TOP, 
+                                              format="%.2e")
+                    C_CU_BOTTOM = st.number_input("Bottom: Cu", value=PhysicalParameters.C_CU_BOTTOM,
+                                                 format="%.2e")
+                with col2:
+                    C_NI_TOP = st.number_input("Top: Ni", value=PhysicalParameters.C_NI_TOP,
+                                              format="%.2e")
+                    C_NI_BOTTOM = st.number_input("Bottom: Ni", value=PhysicalParameters.C_NI_BOTTOM,
+                                                 format="%.2e")
             
-            else:  # spherical_1d
-                r_batch = torch.full((len(t_batch), 1), constants.particle_radius, device=constants.device, dtype=torch.float32)
-                outputs = model(r_batch, t_batch)
+            # Neural network parameters
+            with st.expander("🧠 Neural Network Parameters", expanded=True):
+                hidden_layers = st.slider("Hidden Layers", 4, 12, 8)
+                hidden_dim = st.slider("Hidden Dimension", 64, 512, 256, step=64)
+                fourier_features = st.checkbox("Use Fourier Features", value=True)
+                dropout_rate = st.slider("Dropout Rate", 0.0, 0.3, 0.05, 0.01)
+            
+            # Training parameters
+            with st.expander("⚡ Training Parameters", expanded=True):
+                epochs = st.number_input("Epochs", 1000, 50000, 10000, step=1000)
+                initial_lr = st.number_input("Initial Learning Rate", 1e-5, 1e-2, 1e-3, 
+                                           format="%.0e")
+                batch_size = st.selectbox("Batch Size", [1024, 2048, 4096, 8192], index=2)
                 
-                if 'V' in outputs:
-                    V_pred[i:end_idx] = outputs['V'].squeeze().cpu().numpy()
-                V_eq[i:end_idx] = (constants.V0 - (1/constants.F) * outputs['mu'].squeeze()).cpu().numpy()
-    
-    # Create plot
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
-    
-    if 'V' in outputs:
-        ax.plot(t_values.cpu().numpy().flatten(), V_pred, 'b-', linewidth=2.5, label='PINN Prediction')
-    
-    ax.plot(t_values.cpu().numpy().flatten(), V_eq, 'r--', linewidth=2.5, label='Thermodynamic Equilibrium')
-    ax.axhline(constants.V0, color='g', linestyle=':', linewidth=2, alpha=0.7, label='Reference Voltage (V₀)')
-    
-    # Add phase separation plateau region
-    plateau_start = 0.2 * constants.T_max
-    plateau_end = 0.8 * constants.T_max
-    ax.axvspan(plateau_start, plateau_end, alpha=0.1, color='blue', label='Two-phase Coexistence')
-    
-    ax.set_xlabel('Time (s)', fontsize=12)
-    ax.set_ylabel('Voltage (V vs Li/Li⁺)', fontsize=12)
-    ax.set_title('Voltage Evolution During Phase Decomposition', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    # Add annotations for key regions
-    if 'V' in outputs:
-        ax.annotate('Phase Separation\nPlateau', 
-                   xy=(0.5*constants.T_max, 0.5*(np.min(V_pred) + constants.V0)),
-                   xytext=(0.6*constants.T_max, 0.4*(np.min(V_pred) + constants.V0)),
-                   arrowprops=dict(arrowstyle='->', color='black'))
-    
-    plt.tight_layout()
-    return fig
-
-# =====================================================
-# STREAMLIT APP WITH PERFORMANCE OPTIMIZATIONS
-# =====================================================
-def main_optimized():
-    """Optimized Streamlit app with performance improvements"""
-    st.set_page_config(
-        page_title="LiFePO₄ Phase Decomposition PINN",
-        page_icon="🔋",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Performance settings
-    st.sidebar.header("⚡ Performance Settings")
-    device_option = st.sidebar.selectbox(
-        "Compute Device",
-        ["Auto", "CPU", "GPU"] if torch.cuda.is_available() else ["CPU"],
-        index=0 if torch.cuda.is_available() else 0,
-        help="GPU acceleration recommended for faster training"
-    )
-    
-    # Handle device selection with validation
-    if device_option == "GPU":
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if not torch.cuda.is_available():
-            st.sidebar.warning("CUDA not available. Falling back to CPU.")
-    elif device_option == "Auto":
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = 'cpu'
-    
-    # Set random seed for reproducibility
-    torch.manual_seed(42)
-    if device == 'cuda' and torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    np.random.seed(42)
-    
-    st.title("🔋 Physics-Informed Neural Network for LiFePO₄ Phase Decomposition")
-    st.markdown("""
-    ### High-Performance Simulation of LiFePO₄ ↔ FePO₄ Phase Transformation
-    This application uses optimized Physics-Informed Neural Networks (PINNs) to solve the
-    Cahn-Hilliard phase field model for battery electrode materials with enhanced numerical stability and performance.
-    """)
-    
-    # Initialize session state
-    if 'model_trained' not in st.session_state:
-        st.session_state.model_trained = False
-    if 'model' not in st.session_state:
-        st.session_state.model = None
-    if 'history' not in st.session_state:
-        st.session_state.history = None
-    
-    # Sidebar controls
-    with st.sidebar:
-        st.header("🎛️ Simulation Parameters")
-        
-        # Geometry selection
-        geometry = st.selectbox(
-            "Geometry",
-            ["cartesian_2d", "spherical_1d"],
-            index=0,
-            format_func=lambda x: "2D Planar Electrode" if x == "cartesian_2d" else "1D Spherical Particle",
-            help="2D for electrode-scale simulations, 1D for single particle analysis"
-        )
-        
-        # Physics options
-        col1, col2 = st.columns(2)
-        with col1:
-            include_voltage = st.checkbox("Include Voltage Prediction", value=True, 
-                                         help="Enable voltage calculation via Nernst equation")
-        with col2:
-            include_butler_volmer = st.checkbox("Include Butler-Volmer Kinetics",
-                                               value=(geometry == "spherical_1d"),
-                                               help="Enable electrochemical kinetics at particle surface",
-                                               disabled=(geometry == "cartesian_2d"))
-        
-        # Training parameters
-        st.subheader("⚡ Training Parameters")
-        epochs = st.slider("Maximum Epochs", 100, 10000, 3000, 100,
-                          help="Higher values for better convergence but longer training")
-        learning_rate = st.selectbox("Initial Learning Rate", 
-                                   [5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4], 
-                                   index=2,
-                                   help="Lower values for stable training, higher for faster convergence")
-        
-        # Advanced training options
-        with st.expander("Advanced Training Options"):
-            weight_decay = st.slider("Weight Decay", 1e-6, 1e-3, 1e-5, format="%.1e")
-            use_lookahead = st.checkbox("Use Lookahead Optimizer", value=True,
-                                       help="Improves convergence stability")
-            mixed_precision = st.checkbox("Mixed Precision Training", 
-                                         value=(device == 'cuda' and torch.cuda.is_available()),
-                                         disabled=(device != 'cuda'),
-                                         help="Reduces memory usage on GPU")
-        
-        # Material parameters
-        st.subheader("🔬 Material Parameters")
-        particle_radius_nm = st.slider("Particle Radius (nm)", 10, 200, 50, 5,
-                                      help="Radius of spherical LiFePO₄ particles")
-        particle_radius = particle_radius_nm * 1e-9
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            W_scale = st.slider("Phase Separation Strength", 0.5, 5.0, 1.0, 0.1,
-                               help="Higher values increase driving force for phase separation")
-        with col2:
-            mobility_scale = st.slider("Mobility Scale", 0.1, 10.0, 1.0, 0.1,
-                                      help="Higher values accelerate phase transformation kinetics")
-        
-        # Initial conditions
-        st.subheader("🎯 Initial Conditions")
-        init_type = st.selectbox("Initial Profile",
-                               ["Uniform + Noise", "Gradient", "Phase Interface"],
-                               help="Starting concentration distribution")
-        
-        # Experimental data upload
-        st.subheader("📊 Experimental Data")
-        uploaded_file = st.file_uploader("Upload experimental data (JSON)",
-                                       type=['json'],
-                                       help="Include voltage or concentration measurements for data assimilation")
-        experimental_data = None
-        if uploaded_file:
-            try:
-                experimental_data = json.load(uploaded_file)
-                st.success(f"✅ Successfully loaded {len(experimental_data)} data points")
-                # Validate data structure
-                valid_points = []
-                for dp in experimental_data:
-                    if 'type' in dp and dp['type'] in ['voltage', 'concentration_profile']:
-                        valid_points.append(dp)
-                if len(valid_points) < len(experimental_data):
-                    st.warning(f"⚠️ Only {len(valid_points)} of {len(experimental_data)} data points have valid format")
-                experimental_data = valid_points
-            except Exception as e:
-                st.error(f"❌ Failed to load JSON file: {str(e)}")
-        
-        # Run button with progress bar
-        run_button = st.button("🚀 Run Simulation", type="primary", use_container_width=True)
-        
-        if run_button:
-            with st.spinner("Initializing training..."):
-                # Initialize constants with validated device
-                try:
-                    constants = PhysicalConstants(device=device)
-                    constants.particle_radius = particle_radius
-                    constants.W *= W_scale
-                    constants.M *= mobility_scale
-                    
-                    # Show training configuration summary
-                    with st.expander("🔧 Training Configuration Summary"):
-                        st.markdown(f"""
-                        **Physics Settings:**
-                        - Geometry: {geometry.replace('_', ' ').title()}
-                        - Voltage prediction: {'Enabled' if include_voltage else 'Disabled'}
-                        - Butler-Volmer kinetics: {'Enabled' if include_butler_volmer else 'Disabled'}
-                        
-                        **Numerical Settings:**
-                        - Device: {device.upper()}
-                        - Epochs: {epochs}
-                        - Learning rate: {learning_rate:.0e}
-                        - Mixed precision: {'Enabled' if mixed_precision and device=='cuda' else 'Disabled'}
-                        
-                        **Material Parameters:**
-                        - Particle radius: {particle_radius_nm} nm
-                        - Phase separation strength: {W_scale:.1f}×
-                        - Mobility: {mobility_scale:.1f}×
-                        
-                        **Data:**
-                        - Experimental data points: {len(experimental_data) if experimental_data else 0}
-                        """)
-                    
-                    # Training progress container
-                    progress_container = st.empty()
-                    loss_container = st.empty()
-                    
-                    # Train model with optimizations
-                    try:
-                        with st.spinner("Training PINN model... This may take several minutes"):
-                            start_time = time.time()
-                            
-                            model, history = train_pinn_model_optimized(
-                                constants=constants,
-                                geometry=geometry,
-                                include_voltage=include_voltage,
-                                experimental_data=experimental_data,
-                                epochs=epochs,
-                                lr=learning_rate,
-                                device=device
-                            )
-                            
-                            training_time = time.time() - start_time
-                            
-                            # Store results in session state
-                            st.session_state.model_trained = True
-                            st.session_state.model = model
-                            st.session_state.history = history
-                            st.session_state.constants = constants
-                            st.session_state.geometry = geometry
-                            st.session_state.training_time = training_time
-                            
-                            st.success(f"✅ Training completed successfully in {training_time:.1f} seconds!")
-                            st.balloons()
-                            
-                    except Exception as e:
-                        st.error(f"❌ Training failed: {str(e)}")
-                        st.exception(e)
-                        
-                except Exception as e:
-                    st.error(f"❌ Failed to initialize physical constants: {str(e)}")
-                    st.exception(e)
-    
-    # Main content area
-    if st.session_state.model_trained and st.session_state.model is not None:
-        model = st.session_state.model
-        history = st.session_state.history
-        constants = st.session_state.constants
-        geometry = st.session_state.geometry
-        training_time = st.session_state.training_time
-        
-        # Display training summary
-        st.header("📊 Training Results")
-        st.markdown(f"**Training completed in {training_time:.1f} seconds on {constants.device.upper()}**")
-        
-        # Loss history with metrics
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.subheader("Training Loss Evolution")
-            loss_fig = plot_loss_history_optimized(history)
-            st.pyplot(loss_fig)
+                col1, col2 = st.columns(2)
+                with col1:
+                    use_lr_scheduler = st.checkbox("LR Scheduler", value=True)
+                with col2:
+                    use_gradient_clipping = st.checkbox("Gradient Clipping", value=True)
             
-            # Performance metrics
-            with st.expander("📈 Performance Metrics"):
-                col_metrics1, col_metrics2 = st.columns(2)
-                with col_metrics1:
-                    st.metric("Final Total Loss", f"{history['total_loss'][-1]:.2e}")
-                    st.metric("Best Total Loss", f"{min(history['total_loss']):.2e}")
-                    st.metric("Convergence Rate", f"{history['total_loss'][0]/history['total_loss'][-1]:.1f}×")
-                with col_metrics2:
-                    st.metric("Average Epoch Time", f"{np.mean(history['training_time']):.3f}s")
-                    st.metric("Peak Memory Usage", "Optimized")
-                    st.metric("Training Speed", f"{len(history['total_loss'])/training_time:.1f} epochs/s")
-        
-        with col2:
-            st.subheader("Key Metrics")
-            
-            # Final loss values
-            final_losses = {
-                'Total': history['total_loss'][-1],
-                'PDE': history['pde_loss'][-1],
-                'BC': history['bc_loss'][-1],
-                'IC': history['ic_loss'][-1],
+            # Return parameters
+            params = {
+                'D11': D11, 'D12': D12, 'D21': D21, 'D22': D22,
+                'Lx': Lx, 'Ly': Ly, 'T_max': T_max,
+                'C_CU_TOP': C_CU_TOP, 'C_CU_BOTTOM': C_CU_BOTTOM,
+                'C_NI_TOP': C_NI_TOP, 'C_NI_BOTTOM': C_NI_BOTTOM,
+                'hidden_layers': hidden_layers,
+                'hidden_dim': hidden_dim,
+                'fourier_features': fourier_features,
+                'dropout_rate': dropout_rate,
+                'epochs': epochs,
+                'initial_lr': initial_lr,
+                'batch_size': batch_size,
+                'use_lr_scheduler': use_lr_scheduler,
+                'use_gradient_clipping': use_gradient_clipping
             }
-            if include_voltage:
-                final_losses['Voltage'] = history['voltage_loss'][-1]
-            if experimental_data:
-                final_losses['Data'] = history['data_loss'][-1]
             
-            loss_df = pd.DataFrame({
-                'Loss Type': list(final_losses.keys()),
-                'Value': [f"{v:.2e}" for v in final_losses.values()]
-            })
-            st.dataframe(loss_df, hide_index=True)
-            
-            # Hardware utilization
-            st.subheader("Hardware Utilization")
-            hardware_df = pd.DataFrame({
-                'Metric': ['Device', 'Precision', 'Memory Optimized'],
-                'Value': [
-                    constants.device.upper(),
-                    'Mixed' if device=='cuda' else 'Single',
-                    'Yes (Gradient Checkpointing)'
-                ]
-            })
-            st.dataframe(hardware_df, hide_index=True)
+            return params
+    
+    def run_simulation(self, params):
+        """Run the PINN simulation"""
+        st.markdown("## 🚀 Running Simulation")
         
-        # Results section with tabs
-        st.header("🔬 Simulation Results")
-        tab1, tab2, tab3, tab4 = st.tabs(["Phase Evolution", "Voltage Profile", "Physics Validation", "Export Results"])
+        # Create progress tracker
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        training_log = st.empty()
+        
+        # Initialize model
+        with st.spinner("Initializing model..."):
+            model = EnhancedPINN(
+                params=params,
+                hidden_layers=params['hidden_layers'],
+                hidden_dim=params['hidden_dim'],
+                fourier_features=params['fourier_features'],
+                dropout_rate=params['dropout_rate']
+            )
+            
+            trainer = PINNTrainer(model, params, OUTPUT_DIR)
+            
+            # Update trainer config
+            trainer.config.update({
+                'epochs': params['epochs'],
+                'initial_lr': params['initial_lr'],
+                'batch_size': params['batch_size']
+            })
+        
+        # Training progress callback
+        def update_progress(epoch, total_epochs, loss):
+            progress = epoch / total_epochs
+            progress_bar.progress(progress)
+            status_text.text(f"Epoch {epoch}/{total_epochs} - Loss: {loss:.6f}")
+            
+            # Update log occasionally
+            if epoch % 100 == 0:
+                training_log.text(f"Epoch {epoch}: Loss = {loss:.6f}")
+        
+        # Run training
+        try:
+            with st.spinner("Training in progress..."):
+                loss_history = trainer.train(progress_callback=update_progress)
+            
+            # Training complete
+            progress_bar.progress(1.0)
+            status_text.text("Training completed successfully!")
+            
+            # Generate solution
+            with st.spinner("Generating solution..."):
+                solution = self.generate_solution(model, params)
+            
+            # Analyze solution
+            with st.spinner("Analyzing results..."):
+                analyzer = SolutionAnalyzer(solution, params, OUTPUT_DIR)
+                analysis_plots = analyzer.create_comprehensive_plots()
+            
+            # Export to VTK
+            with st.spinner("Exporting to VTK..."):
+                exporter = VTKExporter(solution, params, OUTPUT_DIR)
+                export_files = exporter.export_for_paraview_state()
+            
+            # Update session state
+            st.session_state.training_complete = True
+            st.session_state.model = model
+            st.session_state.solution_data = solution
+            st.session_state.loss_history = loss_history
+            st.session_state.analysis_plots = analysis_plots
+            st.session_state.export_files = export_files
+            
+            st.success("✅ Simulation completed successfully!")
+            
+        except Exception as e:
+            st.error(f"❌ Simulation failed: {str(e)}")
+            logger.error(f"Simulation failed: {str(e)}", exc_info=True)
+    
+    def generate_solution(self, model, params):
+        """Generate solution on a grid"""
+        # Create grid
+        nx, ny = 100, 100  # Higher resolution for better visualization
+        x = torch.linspace(0, params['Lx'], nx)
+        y = torch.linspace(0, params['Ly'], ny)
+        X, Y = torch.meshgrid(x, y, indexing='xy')
+        
+        # Time points
+        num_times = 50
+        times = np.linspace(0, params['T_max'], num_times)
+        
+        # Evaluate model at each time
+        c1_preds = []
+        c2_preds = []
+        
+        model.eval()
+        with torch.no_grad():
+            for t_val in times:
+                t = torch.full((X.numel(), 1), t_val)
+                c_pred = model(X.reshape(-1, 1), Y.reshape(-1, 1), t)
+                
+                c1 = c_pred[:, 0].numpy().reshape(ny, nx)
+                c2 = c_pred[:, 1].numpy().reshape(ny, nx)
+                
+                c1_preds.append(c1)
+                c2_preds.append(c2)
+        
+        # Create solution dictionary
+        solution = {
+            'X': X.numpy(),
+            'Y': Y.numpy(),
+            'c1_preds': c1_preds,
+            'c2_preds': c2_preds,
+            'times': times,
+            'params': params,
+            'grid_info': {
+                'nx': nx, 'ny': ny,
+                'num_times': num_times
+            }
+        }
+        
+        return solution
+    
+    def display_results(self):
+        """Display simulation results"""
+        if not st.session_state.training_complete:
+            return
+        
+        st.markdown("## 📊 Simulation Results")
+        
+        # Create tabs for different result categories
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📈 Training Metrics", 
+            "🔍 Concentration Profiles",
+            "📊 Analysis & Validation",
+            "📁 Export & Download",
+            "📋 Summary Report"
+        ])
         
         with tab1:
-            st.subheader("Phase Decomposition Dynamics")
-            
-            if geometry == "cartesian_2d":
-                # Time slider for 2D visualization
-                t_min, t_max = 0.0, float(constants.T_max)
-                t_step = max(1.0, (t_max - t_min) / 100)
-                t_value = st.slider(
-                    "Select time for visualization (s)",
-                    t_min, t_max, t_max/2, t_step
-                )
-                
-                # Resolution selection
-                resolution = st.select_slider(
-                    "Spatial Resolution",
-                    options=[50, 100, 200],
-                    value=100,
-                    format_func=lambda x: f"{x}×{x} grid"
-                )
-                
-                with st.spinner("Generating concentration profile..."):
-                    try:
-                        profile_fig = plot_concentration_profile_2d_optimized(
-                            model, constants, t_value, resolution=resolution
-                        )
-                        st.pyplot(profile_fig)
-                    except Exception as e:
-                        st.error(f"Failed to generate plot: {str(e)}")
-                
-                # Animation over time
-                if st.checkbox("Show time evolution animation"):
-                    time_points = np.linspace(0, t_max, 6)
-                    cols = st.columns(3)
-                    for idx, t_val in enumerate(time_points):
-                        with cols[idx % 3]:
-                            with st.spinner(f"Rendering t={t_val:.0f}s..."):
-                                try:
-                                    fig_small, ax = plt.subplots(figsize=(4, 3), dpi=100)
-                                    x = torch.linspace(0, constants.Lx, 100, device=device, dtype=torch.float32).reshape(-1, 1)
-                                    y = torch.full_like(x, constants.Ly/2)
-                                    t = torch.full_like(x, t_val)
-                                    
-                                    with torch.no_grad():
-                                        outputs = model(x, y, t)
-                                        c_pred = outputs['c'].cpu().numpy()
-                                    
-                                    ax.plot(x.cpu().numpy()*1e9, c_pred, 'b-', linewidth=2)
-                                    ax.axhline(constants.c_alpha, color='r', linestyle='--', alpha=0.5)
-                                    ax.axhline(constants.c_beta, color='g', linestyle='--', alpha=0.5)
-                                    ax.set_title(f't = {t_val:.0f} s')
-                                    ax.set_xlabel('x (nm)')
-                                    ax.set_ylabel('Li concentration')
-                                    ax.grid(True, alpha=0.3)
-                                    st.pyplot(fig_small)
-                                    plt.close(fig_small)
-                                except Exception as e:
-                                    st.error(f"Failed to render animation frame: {str(e)}")
-            
-            else:  # spherical_1d
-                # Multiple time points for spherical
-                time_options = [0.0, constants.T_max/4, constants.T_max/2,
-                               3*constants.T_max/4, constants.T_max]
-                time_points = st.multiselect(
-                    "Select time points for spherical profiles",
-                    options=time_options,
-                    default=[0.0, constants.T_max/2, constants.T_max]
-                )
-                
-                if time_points:
-                    with st.spinner("Generating spherical profiles..."):
-                        try:
-                            profile_fig = plot_spherical_profile_optimized(model, constants, time_points)
-                            st.pyplot(profile_fig)
-                        except Exception as e:
-                            st.error(f"Failed to generate plot: {str(e)}")
+            self.display_training_metrics()
         
         with tab2:
-            st.subheader("Electrochemical Response")
-            
-            if model.include_voltage:
-                with st.spinner("Computing voltage profile..."):
-                    try:
-                        voltage_fig = plot_voltage_profile_optimized(model, constants, geometry)
-                        st.pyplot(voltage_fig)
-                    except Exception as e:
-                        st.error(f"Failed to generate voltage plot: {str(e)}")
-                
-                # Extract voltage data for download
-                try:
-                    t_values = np.linspace(0, constants.T_max, 200)
-                    if geometry == "cartesian_2d":
-                        x = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.Lx / 2
-                        y = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.Ly / 2
-                        t = torch.tensor(t_values, dtype=torch.float32, device=device).reshape(-1, 1)
-                        with torch.no_grad():
-                            outputs = model(x, y, t)
-                            V_pred = outputs['V'].cpu().detach().numpy().flatten() if 'V' in outputs else np.zeros_like(t_values)
-                    else:
-                        r = torch.ones((200, 1), device=device, dtype=torch.float32) * constants.particle_radius
-                        t = torch.tensor(t_values, dtype=torch.float32, device=device).reshape(-1, 1)
-                        with torch.no_grad():
-                            outputs = model(r, t)
-                            V_pred = outputs['V'].cpu().detach().numpy().flatten() if 'V' in outputs else np.zeros_like(t_values)
-                    
-                    # Create downloadable CSV
-                    voltage_df = pd.DataFrame({
-                        'Time (s)': t_values,
-                        'Voltage (V)': V_pred,
-                        'Reference Voltage (V)': constants.V0
-                    })
-                    
-                    csv = voltage_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Voltage Data (CSV)",
-                        data=csv,
-                        file_name="voltage_profile.csv",
-                        mime="text/csv"
-                    )
-                except Exception as e:
-                    st.error(f"Failed to extract voltage data: {str(e)}")
-            else:
-                st.info("Voltage prediction was not enabled in this simulation. Enable it in the sidebar and rerun.")
+            self.display_concentration_profiles()
         
         with tab3:
-            st.subheader("Physics Validation Metrics")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                # Mass conservation check
-                st.markdown("### Mass Conservation")
-                if geometry == "cartesian_2d":
-                    with st.spinner("Checking mass conservation..."):
-                        try:
-                            t_test = torch.tensor([0.0, constants.T_max/2, constants.T_max], 
-                                                device=device, dtype=torch.float32).reshape(-1, 1)
-                            total_mass = []
-                            for t_val in t_test:
-                                x = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Lx
-                                y = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Ly
-                                t_full = torch.full_like(x, t_val.item(), device=device)
-                                with torch.no_grad():
-                                    outputs = model(x, y, t_full)
-                                    avg_c = outputs['c'].mean().item()
-                                total_mass.append(avg_c)
-                            
-                            mass_change = max(total_mass) - min(total_mass)
-                            mass_change_pct = (mass_change / constants.c_avg) * 100
-                            
-                            if mass_change_pct < 0.1:
-                                st.success(f"Excellent conservation: {mass_change_pct:.3f}%")
-                            elif mass_change_pct < 1.0:
-                                st.warning(f"Good conservation: {mass_change_pct:.3f}%")
-                            else:
-                                st.error(f"Poor conservation: {mass_change_pct:.3f}%")
-                        except Exception as e:
-                            st.error(f"Mass conservation check failed: {str(e)}")
-                else:
-                    st.success("✓ Radial symmetry enforced")
-            
-            with col2:
-                # Phase fractions
-                st.markdown("### Phase Fractions")
-                if geometry == "cartesian_2d":
-                    with st.spinner("Computing phase fractions..."):
-                        try:
-                            x = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Lx
-                            y = torch.rand(1000, 1, device=device, dtype=torch.float32) * constants.Ly
-                            t = torch.full_like(x, constants.T_max, device=device, dtype=torch.float32)
-                            with torch.no_grad():
-                                outputs = model(x, y, t)
-                                c = outputs['c'].cpu().detach().numpy()
-                            
-                            phase_FePO4 = np.sum(c < 0.5) / len(c)
-                            phase_LiFePO4 = np.sum(c >= 0.5) / len(c)
-                            
-                            st.metric("FePO₄ Fraction", f"{phase_FePO4:.3f}")
-                            st.metric("LiFePO₄ Fraction", f"{phase_LiFePO4:.3f}")
-                            
-                            # Interface width estimation
-                            x_line = torch.linspace(0, constants.Lx, 200, device=device, dtype=torch.float32).reshape(-1, 1)
-                            y_line = torch.full_like(x_line, constants.Ly/2)
-                            t_line = torch.full_like(x_line, constants.T_max, device=device, dtype=torch.float32)
-                            
-                            with torch.enable_grad():
-                                x_line.requires_grad = True
-                                outputs_line = model(x_line, y_line, t_line)
-                                c_line = outputs_line['c']
-                                c_x = torch.autograd.grad(c_line, x_line, 
-                                                        grad_outputs=torch.ones_like(c_line),
-                                                        create_graph=True)[0]
-                            
-                            max_grad = torch.max(torch.abs(c_x)).item()
-                            interface_width = (constants.c_beta - constants.c_alpha) / max_grad
-                            interface_width_nm = interface_width * 1e9
-                            
-                            st.metric("Interface Width", f"{interface_width_nm:.1f} nm")
-                            if abs(interface_width_nm - 1.0) < 0.5:
-                                st.success("✓ Matches theoretical value")
-                            else:
-                                st.warning("⚠️ Deviates from expected 1nm")
-                        except Exception as e:
-                            st.error(f"Phase fraction computation failed: {str(e)}")
-            
-            with col3:
-                # Physics validation summary
-                st.markdown("### Physics Metrics Summary")
-                try:
-                    validation_metrics = {
-                        'Interface Width (nm)': interface_width_nm if geometry == "cartesian_2d" else 1.0,
-                        'Mass Conservation (%)': mass_change_pct if geometry == "cartesian_2d" else 0.0,
-                        'Phase Purity': max(phase_FePO4, phase_LiFePO4) if geometry == "cartesian_2d" else 0.95,
-                        'Energy Dissipation': 0.85  # Placeholder
-                    }
-                    
-                    validation_df = pd.DataFrame({
-                        'Metric': list(validation_metrics.keys()),
-                        'Value': list(validation_metrics.values()),
-                        'Status': ['✓ Good' if (k == 'Interface Width (nm)' and 0.5 <= v <= 1.5) or 
-                                  (k == 'Mass Conservation (%)' and v < 1.0) or
-                                  (k == 'Phase Purity' and v > 0.8) or
-                                  (k == 'Energy Dissipation' and v > 0.5) 
-                                  else '⚠️ Check' for k, v in validation_metrics.items()]
-                    })
-                    
-                    st.dataframe(validation_df, hide_index=True)
-                except Exception as e:
-                    st.error(f"Validation summary failed: {str(e)}")
+            self.display_analysis_validation()
         
         with tab4:
-            st.subheader("Export Results")
-            
-            # Model export
-            st.markdown("### Save Trained Model")
-            model_name = st.text_input("Model Name", f"lifepo4_pinn_{datetime.now().strftime('%Y%m%d_%H%M')}")
-            
-            if st.button("💾 Save PINN Model"):
-                try:
-                    # Save model state with comprehensive metadata
-                    model_dict = {
-                        'model_state': model.state_dict(),
-                        'constants': {
-                            'W': constants.W,
-                            'kappa': constants.kappa,
-                            'M': constants.M,
-                            'c_alpha': constants.c_alpha,
-                            'c_beta': constants.c_beta,
-                            'V0': constants.V0,
-                            'geometry': geometry,
-                            'include_voltage': include_voltage
-                        },
-                        'history': history,
-                        'metadata': {
-                            'training_time': training_time,
-                            'epochs_completed': len(history['total_loss']),
-                            'device': str(constants.device),
-                            'timestamp': datetime.now().isoformat()
-                        }
-                    }
-                    
-                    # Convert to bytes for download
-                    buffer = io.BytesIO()
-                    torch.save(model_dict, buffer)
-                    buffer.seek(0)
-                    
-                    st.download_button(
-                        label="📥 Download Trained Model (.pt)",
-                        data=buffer,
-                        file_name=f"{model_name}.pt",
-                        mime="application/octet-stream"
-                    )
-                    
-                    st.success("✅ Model saved successfully!")
-                except Exception as e:
-                    st.error(f"❌ Failed to save model: {str(e)}")
-            
-            # Additional export options
-            st.markdown("### Additional Export Options")
-            col_export1, col_export2 = st.columns(2)
-            
-            with col_export1:
-                if st.button("📊 Export Loss History"):
-                    try:
-                        loss_history_df = pd.DataFrame({
-                            'Epoch': range(len(history['total_loss'])),
-                            'Total Loss': history['total_loss'],
-                            'PDE Loss': history['pde_loss'],
-                            'BC Loss': history['bc_loss'],
-                            'IC Loss': history['ic_loss'],
-                            'Voltage Loss': history['voltage_loss'] if include_voltage else [0]*len(history['total_loss']),
-                            'Data Loss': history['data_loss'] if experimental_data else [0]*len(history['total_loss'])
-                        })
-                        
-                        csv = loss_history_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Loss History (CSV)",
-                            data=csv,
-                            file_name="loss_history.csv",
-                            mime="text/csv"
-                        )
-                    except Exception as e:
-                        st.error(f"Failed to export loss history: {str(e)}")
-            
-            with col_export2:
-                if st.button("📋 Export Parameters"):
-                    try:
-                        params_dict = {
-                            'geometry': geometry,
-                            'include_voltage': include_voltage,
-                            'particle_radius_nm': particle_radius_nm,
-                            'W_scale': W_scale,
-                            'mobility_scale': mobility_scale,
-                            'epochs': epochs,
-                            'learning_rate': learning_rate,
-                            'device': str(constants.device),
-                            'training_time': training_time
-                        }
-                        
-                        params_json = json.dumps(params_dict, indent=2)
-                        st.download_button(
-                            label="📥 Download Parameters (JSON)",
-                            data=params_json,
-                            file_name="simulation_parameters.json",
-                            mime="application/json"
-                        )
-                    except Exception as e:
-                        st.error(f"Failed to export parameters: {str(e)}")
+            self.display_export_download()
+        
+        with tab5:
+            self.display_summary_report()
     
-    else:
-        # Show instructions when not running
-        st.info("👈 Configure parameters in the sidebar and click 'Run Simulation' to start.")
-        
-        # Display theory information
-        with st.expander("📚 Theory Overview", expanded=True):
-            st.markdown("""
-            ### Physics of LiFePO₄ Phase Decomposition
-            **Governing Equations:**
-            1. **Cahn-Hilliard Phase Field Model:**
-            ```
-            ∂c/∂t = ∇·(M ∇μ)
-            μ = ∂f/∂c - κ∇²c
-            f(c) = W c²(1-c)²
-            ```
-            2. **Voltage Prediction (Nernst Equation):**
-            ```
-            V = V₀ - (1/F) ⟨μ⟩
-            ```
-            3. **Butler-Volmer Kinetics (for spherical particles):**
-            ```
-            j = i₀[exp(αFη/RT) - exp(-(1-α)Fη/RT)]
-            η = V - [V₀ - (1/F)μ_surface]
-            ```
+    def display_training_metrics(self):
+        """Display training metrics and loss plots"""
+        if st.session_state.loss_history:
+            # Plot loss history
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             
-            **Numerical Enhancements:**
-            - Fourier feature mapping for improved spatial frequency representation
-            - Adaptive sampling focusing on high-residual regions
-            - Mixed precision training for GPU acceleration
-            - Lookahead optimizer for stable convergence
-            - Interface regularization for physical consistency
-            """)
+            epochs = range(1, len(st.session_state.loss_history['total']) + 1)
+            
+            # Total loss
+            axes[0, 0].plot(epochs, st.session_state.loss_history['total'], 'b-', linewidth=2)
+            axes[0, 0].set_yscale('log')
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Total Loss')
+            axes[0, 0].set_title('Total Loss History')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Component losses
+            axes[0, 1].plot(epochs, st.session_state.loss_history['physics'], 'r-', 
+                          label='Physics', linewidth=2)
+            axes[0, 1].plot(epochs, st.session_state.loss_history['boundary_bottom'], 'g-',
+                          label='Bottom BC', linewidth=2)
+            axes[0, 1].plot(epochs, st.session_state.loss_history['boundary_top'], 'b-',
+                          label='Top BC', linewidth=2)
+            axes[0, 1].set_yscale('log')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('Loss')
+            axes[0, 1].set_title('Component Losses')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Learning rate
+            axes[1, 0].plot(epochs, st.session_state.loss_history['learning_rate'], 'purple-', 
+                          linewidth=2)
+            axes[1, 0].set_yscale('log')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Learning Rate')
+            axes[1, 0].set_title('Learning Rate Schedule')
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Convergence analysis
+            if len(epochs) > 100:
+                window = 100
+                moving_avg = np.convolve(st.session_state.loss_history['total'], 
+                                       np.ones(window)/window, mode='valid')
+                axes[1, 1].plot(epochs[window-1:], moving_avg, 'orange-', linewidth=2)
+                axes[1, 1].set_yscale('log')
+                axes[1, 1].set_xlabel('Epoch')
+                axes[1, 1].set_ylabel('Moving Average Loss')
+                axes[1, 1].set_title(f'Convergence (Moving Avg, window={window})')
+                axes[1, 1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+            
+            # Loss statistics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                final_loss = st.session_state.loss_history['total'][-1]
+                st.metric("Final Loss", f"{final_loss:.2e}")
+            with col2:
+                min_loss = min(st.session_state.loss_history['total'])
+                st.metric("Minimum Loss", f"{min_loss:.2e}")
+            with col3:
+                convergence_rate = (st.session_state.loss_history['total'][0] / 
+                                  st.session_state.loss_history['total'][-1])
+                st.metric("Convergence Factor", f"{convergence_rate:.1f}x")
+    
+    def display_concentration_profiles(self):
+        """Display concentration profiles"""
+        if st.session_state.analysis_plots:
+            # Show available plots
+            st.image(st.session_state.analysis_plots.get('concentration_2d', ''), 
+                    caption="2D Concentration Grid")
+            
+            # Interactive time selection
+            times = st.session_state.solution_data['times']
+            selected_time = st.slider("Select Time", 0.0, float(times[-1]), 
+                                    float(times[-1]), step=float(times[1]-times[0]))
+            
+            # Find closest time index
+            t_idx = np.argmin(np.abs(times - selected_time))
+            
+            # Display profiles for selected time
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig, ax = plt.subplots(figsize=(6, 5))
+                c1 = st.session_state.solution_data['c1_preds'][t_idx]
+                im = ax.imshow(c1, origin='lower', 
+                             extent=[0, st.session_state.solution_data['params']['Lx'],
+                                    0, st.session_state.solution_data['params']['Ly']],
+                             cmap='viridis')
+                ax.set_title(f'Cu Concentration at t = {selected_time:.1f} s')
+                ax.set_xlabel('x (μm)')
+                ax.set_ylabel('y (μm)')
+                plt.colorbar(im, ax=ax, label='Concentration (mol/μm³)')
+                st.pyplot(fig)
+                plt.close()
+            
+            with col2:
+                fig, ax = plt.subplots(figsize=(6, 5))
+                c2 = st.session_state.solution_data['c2_preds'][t_idx]
+                im = ax.imshow(c2, origin='lower',
+                             extent=[0, st.session_state.solution_data['params']['Lx'],
+                                    0, st.session_state.solution_data['params']['Ly']],
+                             cmap='plasma')
+                ax.set_title(f'Ni Concentration at t = {selected_time:.1f} s')
+                ax.set_xlabel('x (μm)')
+                ax.set_ylabel('y (μm)')
+                plt.colorbar(im, ax=ax, label='Concentration (mol/μm³)')
+                st.pyplot(fig)
+                plt.close()
+            
+            # 3D plot option
+            if st.checkbox("Show 3D Visualization"):
+                st.image(st.session_state.analysis_plots.get('concentration_3d', ''),
+                        caption="3D Concentration Profiles")
+    
+    def display_analysis_validation(self):
+        """Display analysis and validation results"""
+        if st.session_state.analysis_plots:
+            # Create tabs for different analyses
+            anal_tab1, anal_tab2, anal_tab3 = st.tabs([
+                "📈 Time Evolution",
+                "⚖️ Mass Conservation",
+                "✅ Boundary Validation"
+            ])
+            
+            with anal_tab1:
+                st.image(st.session_state.analysis_plots.get('time_evolution', ''),
+                        caption="Time Evolution Analysis")
+            
+            with anal_tab2:
+                st.image(st.session_state.analysis_plots.get('mass_conservation', ''),
+                        caption="Mass Conservation Analysis")
+                
+                # Compute mass conservation metrics
+                solution = st.session_state.solution_data
+                params = solution['params']
+                
+                # Approximate total mass
+                dx = params['Lx'] / (solution['c1_preds'][0].shape[1] - 1)
+                dy = params['Ly'] / (solution['c1_preds'][0].shape[0] - 1)
+                area = dx * dy
+                
+                initial_mass_cu = np.sum(solution['c1_preds'][0]) * area
+                final_mass_cu = np.sum(solution['c1_preds'][-1]) * area
+                mass_change_cu = abs(final_mass_cu - initial_mass_cu) / initial_mass_cu
+                
+                initial_mass_ni = np.sum(solution['c2_preds'][0]) * area
+                final_mass_ni = np.sum(solution['c2_preds'][-1]) * area
+                mass_change_ni = abs(final_mass_ni - initial_mass_ni) / initial_mass_ni
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Cu Mass Change", f"{mass_change_cu*100:.3f}%")
+                with col2:
+                    st.metric("Ni Mass Change", f"{mass_change_ni*100:.3f}%")
+            
+            with anal_tab3:
+                st.image(st.session_state.analysis_plots.get('boundary_validation', ''),
+                        caption="Boundary Condition Validation")
+                
+                # Boundary condition errors
+                solution = st.session_state.solution_data
+                params = solution['params']
+                
+                # Compute boundary errors
+                bottom_cu = solution['c1_preds'][-1][0, :]
+                bottom_ni = solution['c2_preds'][-1][0, :]
+                
+                top_cu = solution['c1_preds'][-1][-1, :]
+                top_ni = solution['c2_preds'][-1][-1, :]
+                
+                bottom_cu_error = np.mean(np.abs(bottom_cu - params['C_CU_BOTTOM']))
+                bottom_ni_error = np.mean(np.abs(bottom_ni - params['C_NI_BOTTOM']))
+                top_cu_error = np.mean(np.abs(top_cu - params['C_CU_TOP']))
+                top_ni_error = np.mean(np.abs(top_ni - params['C_NI_TOP']))
+                
+                st.markdown("**Boundary Condition Errors**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Bottom Cu Error", f"{bottom_cu_error:.2e}")
+                    st.metric("Top Cu Error", f"{top_cu_error:.2e}")
+                with col2:
+                    st.metric("Bottom Ni Error", f"{bottom_ni_error:.2e}")
+                    st.metric("Top Ni Error", f"{top_ni_error:.2e}")
+    
+    def display_export_download(self):
+        """Display export and download options"""
+        st.markdown("## 📁 Export & Download")
         
-        # Show example experimental data format
-        with st.expander("📋 Example Experimental Data Format"):
-            st.code("""
-            [
-                {
-                    "type": "voltage",
-                    "time": [0, 100, 200, 300, 400, 500],
-                    "voltage": [3.42, 3.41, 3.40, 3.39, 3.38, 3.37],
-                    "variance": [0.0001, 0.0001, 0.0001, 0.0001, 0.0001, 0.0001]
-                },
-                {
-                    "type": "concentration_profile",
-                    "time": 300.0,
-                    "x": [0, 10e-9, 20e-9, 30e-9, 40e-9, 50e-9],
-                    "y": [50e-9, 50e-9, 50e-9, 50e-9, 50e-9, 50e-9],
-                    "concentration": [0.1, 0.2, 0.5, 0.8, 0.9, 0.95]
-                }
-            ]
-            """, language="json")
+        if not st.session_state.export_files:
+            st.warning("No export files available. Run the simulation first.")
+            return
         
-        # Quick start example
-        with st.expander("🚀 Quick Start Guide"):
+        # Create download buttons for different formats
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("### 📊 Analysis Plots")
+            if st.session_state.analysis_plots:
+                for plot_name, plot_file in st.session_state.analysis_plots.items():
+                    if os.path.exists(plot_file):
+                        with open(plot_file, 'rb') as f:
+                            st.download_button(
+                                label=f"Download {plot_name}.png",
+                                data=f,
+                                file_name=os.path.basename(plot_file),
+                                mime="image/png"
+                            )
+        
+        with col2:
+            st.markdown("### 📈 VTK Files")
+            if 'vtu_file' in st.session_state.export_files:
+                vtu_file = st.session_state.export_files['vtu_file']
+                if os.path.exists(vtu_file):
+                    with open(vtu_file, 'rb') as f:
+                        st.download_button(
+                            label="Download VTU File (.vtu)",
+                            data=f,
+                            file_name=os.path.basename(vtu_file),
+                            mime="application/octet-stream"
+                        )
+            
+            if 'pvd_file' in st.session_state.export_files:
+                pvd_file = st.session_state.export_files['pvd_file']
+                if os.path.exists(pvd_file):
+                    with open(pvd_file, 'rb') as f:
+                        st.download_button(
+                            label="Download PVD Collection (.pvd)",
+                            data=f,
+                            file_name=os.path.basename(pvd_file),
+                            mime="application/xml"
+                        )
+        
+        with col3:
+            st.markdown("### 📋 Solution Data")
+            # Save solution as pickle
+            solution_file = os.path.join(OUTPUT_DIR, 'solution_data.pkl')
+            with open(solution_file, 'wb') as f:
+                pickle.dump(st.session_state.solution_data, f)
+            
+            with open(solution_file, 'rb') as f:
+                st.download_button(
+                    label="Download Solution (.pkl)",
+                    data=f,
+                    file_name="solution_data.pkl",
+                    mime="application/octet-stream"
+                )
+            
+            # Save parameters as JSON
+            params_file = os.path.join(OUTPUT_DIR, 'simulation_parameters.json')
+            with open(params_file, 'w') as f:
+                json.dump(st.session_state.solution_data['params'], f, indent=2)
+            
+            with open(params_file, 'rb') as f:
+                st.download_button(
+                    label="Download Parameters (.json)",
+                    data=f,
+                    file_name="simulation_parameters.json",
+                    mime="application/json"
+                )
+        
+        # Create ZIP archive of all files
+        st.markdown("### 📦 Complete Archive")
+        if st.button("Create ZIP Archive"):
+            with st.spinner("Creating ZIP archive..."):
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    # Add analysis plots
+                    for plot_file in st.session_state.analysis_plots.values():
+                        if os.path.exists(plot_file):
+                            zip_file.write(plot_file, 
+                                         os.path.basename(plot_file))
+                    
+                    # Add VTK files
+                    if 'vtu_file' in st.session_state.export_files:
+                        vtu_file = st.session_state.export_files['vtu_file']
+                        if os.path.exists(vtu_file):
+                            zip_file.write(vtu_file, os.path.basename(vtu_file))
+                    
+                    # Add PVD file
+                    if 'pvd_file' in st.session_state.export_files:
+                        pvd_file = st.session_state.export_files['pvd_file']
+                        if os.path.exists(pvd_file):
+                            zip_file.write(pvd_file, os.path.basename(pvd_file))
+                    
+                    # Add VTS files
+                    if 'vts_files' in st.session_state.export_files:
+                        for t_val, vts_file in st.session_state.export_files['vts_files']:
+                            if os.path.exists(vts_file):
+                                zip_file.write(vts_file, os.path.basename(vts_file))
+                    
+                    # Add solution data
+                    if os.path.exists(solution_file):
+                        zip_file.write(solution_file, 'solution_data.pkl')
+                    
+                    # Add parameters
+                    if os.path.exists(params_file):
+                        zip_file.write(params_file, 'simulation_parameters.json')
+                    
+                    # Add log file
+                    log_file = os.path.join(OUTPUT_DIR, 'training.log')
+                    if os.path.exists(log_file):
+                        zip_file.write(log_file, 'training.log')
+                
+                # Create download button for ZIP
+                st.download_button(
+                    label="Download Complete Archive (.zip)",
+                    data=zip_buffer.getvalue(),
+                    file_name=f"pinn_simulation_{timestamp}.zip",
+                    mime="application/zip"
+                )
+    
+    def display_summary_report(self):
+        """Display comprehensive summary report"""
+        st.markdown("## 📋 Simulation Summary Report")
+        
+        if not st.session_state.solution_data:
+            st.warning("No simulation data available.")
+            return
+        
+        solution = st.session_state.solution_data
+        params = solution['params']
+        
+        # Create summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Domain Size", f"{params['Lx']:.0f} × {params['Ly']:.0f} μm")
+        with col2:
+            st.metric("Simulation Time", f"{params['T_max']:.0f} s")
+        with col3:
+            st.metric("Grid Resolution", f"{solution['grid_info']['nx']} × {solution['grid_info']['ny']}")
+        with col4:
+            st.metric("Time Steps", solution['grid_info']['num_times'])
+        
+        # Physical parameters table
+        st.markdown("### 🔬 Physical Parameters")
+        phys_params = pd.DataFrame({
+            'Parameter': ['D₁₁', 'D₁₂', 'D₂₁', 'D₂₂', 
+                         'C_Cu_top', 'C_Cu_bottom', 
+                         'C_Ni_top', 'C_Ni_bottom'],
+            'Value': [f"{params['D11']:.5f}", f"{params['D12']:.5f}",
+                     f"{params['D21']:.5f}", f"{params['D22']:.5f}",
+                     f"{params['C_CU_TOP']:.2e}", f"{params['C_CU_BOTTOM']:.2e}",
+                     f"{params['C_NI_TOP']:.2e}", f"{params['C_NI_BOTTOM']:.2e}"],
+            'Units': ['μm²/s', 'μm²/s', 'μm²/s', 'μm²/s',
+                     'mol/μm³', 'mol/μm³', 'mol/μm³', 'mol/μm³']
+        })
+        st.table(phys_params)
+        
+        # Final concentration statistics
+        st.markdown("### 📊 Final Concentration Statistics")
+        final_c1 = solution['c1_preds'][-1]
+        final_c2 = solution['c2_preds'][-1]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Copper (Cu)**")
+            st.metric("Mean", f"{np.mean(final_c1):.2e}")
+            st.metric("Maximum", f"{np.max(final_c1):.2e}")
+            st.metric("Minimum", f"{np.min(final_c1):.2e}")
+            st.metric("Std Dev", f"{np.std(final_c1):.2e}")
+        
+        with col2:
+            st.markdown("**Nickel (Ni)**")
+            st.metric("Mean", f"{np.mean(final_c2):.2e}")
+            st.metric("Maximum", f"{np.max(final_c2):.2e}")
+            st.metric("Minimum", f"{np.min(final_c2):.2e}")
+            st.metric("Std Dev", f"{np.std(final_c2):.2e}")
+        
+        # Training summary
+        if st.session_state.loss_history:
+            st.markdown("### ⚡ Training Summary")
+            final_loss = st.session_state.loss_history['total'][-1]
+            min_loss = min(st.session_state.loss_history['total'])
+            training_time = len(st.session_state.loss_history['total']) * 0.1  # Approximate
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Final Loss", f"{final_loss:.2e}")
+            with col2:
+                st.metric("Best Loss", f"{min_loss:.2e}")
+            with col3:
+                st.metric("Training Time", f"{training_time:.1f} s")
+        
+        # Export summary
+        st.markdown("### 📁 Generated Files")
+        file_counts = {
+            'Analysis Plots': len(st.session_state.analysis_plots),
+            'VTK Files': len(st.session_state.export_files.get('vts_files', [])),
+            'Data Files': 3  # solution, params, log
+        }
+        
+        for file_type, count in file_counts.items():
+            st.markdown(f"- {file_type}: {count} files")
+    
+    def run(self):
+        """Main run method for the Streamlit app"""
+        # Display sidebar and get parameters
+        params = self.create_sidebar_controls()
+        
+        # Run simulation button
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🚀 Run Simulation", type="primary", use_container_width=True):
+            self.run_simulation(params)
+        
+        # Reset button
+        if st.sidebar.button("🔄 Reset Simulation", type="secondary", use_container_width=True):
+            self.initialize_session_state()
+            st.rerun()
+        
+        # Display results if available
+        if st.session_state.training_complete:
+            self.display_results()
+        else:
+            # Show instructions
             st.markdown("""
-            1. **Select Geometry**: Choose 2D planar or 1D spherical
-            2. **Enable Features**: Check voltage prediction and Butler-Volmer kinetics
-            3. **Adjust Parameters**: Modify particle size, phase separation strength
-            4. **Set Training**: Choose epochs (3000 recommended) and learning rate (1e-3)
-            5. **Optional Data**: Upload experimental data for better accuracy
-            6. **Click "Run Simulation"**: Wait for training to complete
-            7. **Explore Results**: Visualize phase decomposition and voltage profiles
-            """)
+            <div class="info-box">
+            <h3>📝 Instructions</h3>
+            <ol>
+            <li>Adjust simulation parameters in the sidebar</li>
+            <li>Click <strong>"Run Simulation"</strong> to start</li>
+            <li>Monitor training progress in real-time</li>
+            <li>View results in the tabs below after completion</li>
+            <li>Download analysis plots and data files</li>
+            </ol>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Show default visualization
+            self.show_example_visualization()
 
-if __name__ == "__main__":
+# ============================================================================
+# 9. MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main function to run the Streamlit app"""
     try:
-        main_optimized()
+        # Initialize the app
+        app = PINNStreamlitApp()
+        app.run()
+        
     except Exception as e:
         st.error(f"Application error: {str(e)}")
-        st.exception(e)
+        logger.error(f"Application error: {str(e)}", exc_info=True)
+
+if __name__ == "__main__":
+    main()
