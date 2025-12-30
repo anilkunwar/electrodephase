@@ -328,37 +328,37 @@ class CahnHilliardPINN(nn.Module):
         return 2.0 * self.A * c + 3.0 * self.B * c**2 + 4.0 * self.C * c**3
 
 # =====================================================
-# PINN Physics Utilities
+# PINN Physics Utilities - FIXED VERSION
 # =====================================================
 
 def laplacian(u: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Compute ∇²u = u_xx + u_yy using automatic differentiation."""
-    # First derivatives
+    # First derivatives - retain_graph=True because we need these for second derivatives
     u_x = torch.autograd.grad(
         u, x, 
         grad_outputs=torch.ones_like(u),
         create_graph=True, 
-        retain_graph=True
+        retain_graph=True  # Keep the graph for second derivative computation
     )[0]
     u_y = torch.autograd.grad(
         u, y, 
         grad_outputs=torch.ones_like(u),
         create_graph=True, 
-        retain_graph=True
+        retain_graph=True  # Keep the graph for second derivative computation
     )[0]
     
-    # Second derivatives
+    # Second derivatives - no need to retain_graph here since these are final outputs
     u_xx = torch.autograd.grad(
         u_x, x, 
         grad_outputs=torch.ones_like(u_x),
         create_graph=True, 
-        retain_graph=True
+        retain_graph=True  # May be needed if this laplacian is used in further computations
     )[0]
     u_yy = torch.autograd.grad(
         u_y, y, 
         grad_outputs=torch.ones_like(u_y),
         create_graph=True, 
-        retain_graph=True
+        retain_graph=True  # May be needed if this laplacian is used in further computations
     )[0]
     
     return u_xx + u_yy
@@ -374,7 +374,7 @@ def pde_residual(model: CahnHilliardPINN,
         c, t, 
         grad_outputs=torch.ones_like(c),
         create_graph=True, 
-        retain_graph=True
+        retain_graph=True  # Keep graph for total loss computation
     )[0]
     
     # Laplacian of concentration: ∇²c
