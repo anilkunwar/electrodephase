@@ -10,7 +10,9 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecompositionpinn4-streamlit-red)](https://lixfepo4-electrodephase-pinn4.streamlit.app/)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/genericphasedecompositionpinn5-streamlit-red)](https://generic-phasedecomposition-pinn5.streamlit.app/)  (generic, uses too much computer memory)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/genericphasedecompositionpinn6-streamlit-red)](https://generic-phasedecomposition-pinn5.streamlit.app/)  (generic, uses too much computer memory)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/genericphasedecompositionpinn6-streamlit-red)](https://generic-phasedecomposition-pinn5.streamlit.app/) 
 
 # phase field method 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition1-streamlit-red)](https://electrode-phasedecomposition1.streamlit.app/)
