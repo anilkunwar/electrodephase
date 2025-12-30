@@ -128,9 +128,6 @@ class FourierFeatureMapping(nn.Module):
         
     def forward(self, x):
         """Apply Fourier features to input coordinates"""
-        #proj = 2 * np.pi * x @ self.B
-        #return torch.cat([x, torch.sin(proj), torch.cos(proj)], dim=-1)
-        # Ensure x and B have same dtype (usually float32)
         x = x.to(self.B.dtype)
         proj = 2 * torch.pi * (x @ self.B)
         return torch.cat([x, torch.sin(proj), torch.cos(proj)], dim=-1)
@@ -323,7 +320,7 @@ class PhysicsOperators:
         return grads
     
     @staticmethod
-    def compute_spherical_laplacian(f, r, eps=1e-12):
+    def compute_spherical_laplacian(f, r, eps=1e-12, create_graph=True):
         """
         Numerically stable spherical Laplacian computation
         ∇²f = (1/r²) ∂/∂r(r² ∂f/∂r)
@@ -336,19 +333,19 @@ class PhysicsOperators:
             r.requires_grad = True
         
         # Compute first derivative
-        f_r = PhysicsOperators.compute_gradient(f, r, create_graph=True)
+        f_r = PhysicsOperators.compute_gradient(f, r, create_graph=create_graph)
         
         # Handle r=0 singularity with series expansion (Taylor series)
         near_zero_mask = (r < 1e-8).squeeze()
         if torch.any(near_zero_mask):
             # For points very close to r=0, use series expansion
             # ∇²f ≈ 3f_rr(0) + O(r²) at r=0
-            f_rr = PhysicsOperators.compute_gradient(f_r, r, create_graph=True)
+            f_rr = PhysicsOperators.compute_gradient(f_r, r, create_graph=create_graph)
             lap_f_zero = 3 * f_rr[near_zero_mask]
             
             # For other points, use standard formula
             r2_f_r = r[~near_zero_mask]**2 * f_r[~near_zero_mask]
-            r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r[~near_zero_mask], create_graph=True)
+            r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r[~near_zero_mask], create_graph=create_graph)
             lap_f = r2_f_r_r / (r[~near_zero_mask]**2 + eps)
             
             # Combine results
@@ -359,12 +356,12 @@ class PhysicsOperators:
         
         # Standard computation away from singularity
         r2_f_r = r**2 * f_r
-        r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r, create_graph=True)
+        r2_f_r_r = PhysicsOperators.compute_gradient(r2_f_r, r, create_graph=create_graph)
         lap_f = r2_f_r_r / (r**2 + eps)
         return lap_f
     
     @staticmethod
-    def compute_laplacian_2d(f, x, y, eps=1e-12):
+    def compute_laplacian_2d(f, x, y, eps=1e-12, create_graph=True):
         """
         Memory-efficient 2D Laplacian computation with shared gradients
         """
@@ -375,11 +372,11 @@ class PhysicsOperators:
         x.requires_grad = True
         y.requires_grad = True
         
-        f_x = PhysicsOperators.compute_gradient(f, x, create_graph=True)
-        f_y = PhysicsOperators.compute_gradient(f, y, create_graph=True)
+        f_x = PhysicsOperators.compute_gradient(f, x, create_graph=create_graph)
+        f_y = PhysicsOperators.compute_gradient(f, y, create_graph=create_graph)
         
-        f_xx = PhysicsOperators.compute_gradient(f_x, x, create_graph=True)
-        f_yy = PhysicsOperators.compute_gradient(f_y, y, create_graph=True)
+        f_xx = PhysicsOperators.compute_gradient(f_x, x, create_graph=create_graph)
+        f_yy = PhysicsOperators.compute_gradient(f_y, y, create_graph=create_graph)
         
         return f_xx + f_yy
 
@@ -449,52 +446,54 @@ class AdaptiveSampler:
         # Get baseline uniform samples
         samples = self.uniform_sample()
         
-        with torch.no_grad():
-            # Compute residuals at sample points
-            if self.geometry == 'cartesian_2d':
-                x, y, t = samples['x'], samples['y'], samples['t']
-                x.requires_grad = True
-                y.requires_grad = True
-                t.requires_grad = True
-                
-                outputs = model(x, y, t)
-                c = outputs['c']
-                mu = outputs['mu']
-                
-                # Compute physics residuals
-                df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-                lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y)
-                mu_physics = df_dc - self.constants.kappa * lap_c
-                mu_residual = torch.abs(mu - mu_physics)
-                
-                # Time derivative
-                c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
-                mu_lap = PhysicsOperators.compute_laplacian_2d(mu, x, y)
-                evol_residual = torch.abs(c_t - self.constants.M * mu_lap)
-                
-                # Combined residual for sampling weights
-                residual = (loss_weights['pde_mu'] * mu_residual + 
-                           loss_weights['pde_evol'] * evol_residual)
-            else:  # spherical_1d
-                r, t = samples['r'], samples['t']
-                r.requires_grad = True
-                t.requires_grad = True
-                
-                outputs = model(r, t)
-                c = outputs['c']
-                mu = outputs['mu']
-                
-                df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-                lap_c = PhysicsOperators.compute_spherical_laplacian(c, r)
-                mu_physics = df_dc - self.constants.kappa * lap_c
-                mu_residual = torch.abs(mu - mu_physics)
-                
-                c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
-                lap_mu = PhysicsOperators.compute_spherical_laplacian(mu, r)
-                evol_residual = torch.abs(c_t - self.constants.M * lap_mu)
-                
-                residual = (loss_weights['pde_mu'] * mu_residual + 
-                           loss_weights['pde_evol'] * evol_residual)
+        # REMOVED: torch.no_grad() - we need gradients for residual computation
+        if self.geometry == 'cartesian_2d':
+            x, y, t = samples['x'], samples['y'], samples['t']
+            x.requires_grad_(True)
+            y.requires_grad_(True)
+            t.requires_grad_(True)
+            
+            outputs = model(x, y, t)
+            c = outputs['c']
+            mu = outputs['mu']
+            
+            # Compute physics residuals
+            df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
+            lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y, create_graph=False)
+            mu_physics = df_dc - self.constants.kappa * lap_c
+            mu_residual = torch.abs(mu - mu_physics)
+            
+            # Time derivative
+            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
+            mu_lap = PhysicsOperators.compute_laplacian_2d(mu, x, y, create_graph=False)
+            evol_residual = torch.abs(c_t - self.constants.M * mu_lap)
+            
+            # Combined residual for sampling weights
+            residual = (loss_weights['pde_mu'] * mu_residual + 
+                       loss_weights['pde_evol'] * evol_residual)
+        else:  # spherical_1d
+            r, t = samples['r'], samples['t']
+            r.requires_grad_(True)
+            t.requires_grad_(True)
+            
+            outputs = model(r, t)
+            c = outputs['c']
+            mu = outputs['mu']
+            
+            df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
+            lap_c = PhysicsOperators.compute_spherical_laplacian(c, r, create_graph=False)
+            mu_physics = df_dc - self.constants.kappa * lap_c
+            mu_residual = torch.abs(mu - mu_physics)
+            
+            c_t = PhysicsOperators.compute_gradient(c, t, create_graph=False)
+            lap_mu = PhysicsOperators.compute_spherical_laplacian(mu, r, create_graph=False)
+            evol_residual = torch.abs(c_t - self.constants.M * lap_mu)
+            
+            residual = (loss_weights['pde_mu'] * mu_residual + 
+                       loss_weights['pde_evol'] * evol_residual)
+        
+        # Detach residuals from computation graph before converting to numpy
+        residual = residual.detach()
         
         # Create sampling weights based on residuals
         weights = residual.squeeze().cpu().numpy()
@@ -628,7 +627,7 @@ class PhysicsLossCalculator:
         
         # Compute chemical potential from physics
         df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-        lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y)
+        lap_c = PhysicsOperators.compute_laplacian_2d(c, x, y, create_graph=True)
         mu_physics = df_dc - self.constants.kappa * lap_c
         
         # Chemical potential residual
@@ -638,7 +637,7 @@ class PhysicsLossCalculator:
         c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True)
         
         # Laplacian of chemical potential
-        lap_mu = PhysicsOperators.compute_laplacian_2d(mu_pred, x, y)
+        lap_mu = PhysicsOperators.compute_laplacian_2d(mu_pred, x, y, create_graph=True)
         
         # Cahn-Hilliard evolution: ∂c/∂t = M∇²μ
         evol_residual = c_t - self.constants.M * lap_mu
@@ -669,7 +668,7 @@ class PhysicsLossCalculator:
         
         # Chemical potential from physics
         df_dc = PhysicsOperators.compute_double_well_derivative(c, self.constants.W)
-        lap_c = PhysicsOperators.compute_spherical_laplacian(c, r)
+        lap_c = PhysicsOperators.compute_spherical_laplacian(c, r, create_graph=True)
         mu_physics = df_dc - self.constants.kappa * lap_c
         
         # Chemical potential residual
@@ -679,7 +678,7 @@ class PhysicsLossCalculator:
         c_t = PhysicsOperators.compute_gradient(c, t, create_graph=True)
         
         # Spherical Laplacian of chemical potential
-        lap_mu = PhysicsOperators.compute_spherical_laplacian(mu_pred, r)
+        lap_mu = PhysicsOperators.compute_spherical_laplacian(mu_pred, r, create_graph=True)
         
         # Evolution equation in spherical coordinates
         evol_residual = c_t - self.constants.M * lap_mu
@@ -1020,7 +1019,6 @@ class TrainingManager:
             mode='min', 
             factor=0.5, 
             patience=100
-            #verbose=True
         )
         
         # Optional lookahead optimizer
