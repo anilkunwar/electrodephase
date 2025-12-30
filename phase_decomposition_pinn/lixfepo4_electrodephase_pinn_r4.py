@@ -1227,7 +1227,6 @@ class TrainingManager:
                 k: getattr(self.constants, k)
                 for k in self.constants.__slots__
                 if k != 'device'
-        },
             },
             'geometry': self.geometry,
             'include_voltage': self.include_voltage
