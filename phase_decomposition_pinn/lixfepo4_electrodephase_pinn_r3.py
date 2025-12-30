@@ -747,7 +747,7 @@ class TrainingManager:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=100,
+            patience=100
             #verbose=True
         )
         if use_lookahead:
