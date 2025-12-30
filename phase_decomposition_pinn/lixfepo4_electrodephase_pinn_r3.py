@@ -748,7 +748,7 @@ class TrainingManager:
             mode='min',
             factor=0.5,
             patience=100,
-            verbose=True
+            #verbose=True
         )
         if use_lookahead:
             self.optimizer = self._wrap_with_lookahead(self.optimizer)
