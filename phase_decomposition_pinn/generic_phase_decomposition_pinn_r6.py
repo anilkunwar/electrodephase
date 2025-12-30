@@ -11,7 +11,7 @@ import torch.optim as optim
 import os
 import pickle
 import logging
-from typing import Dict, Tuple, Optional
+from typing import Dict, Any
 
 # =====================================================
 # Configuration & Setup
@@ -36,23 +36,8 @@ logger = logging.getLogger(__name__)
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Default parameters
-DEFAULT_PARAMS = {
-    'nx': 128,
-    'ny': 128,
-    'Lx': 60.0,
-    'Ly': 60.0,
-    'T_max': 50.0,
-    'W': 1.0,
-    'kappa': 2.0,
-    'M': 1.0,
-    'c0': 0.5,
-    'noise_amp': 0.05,
-    'epochs': 3000,
-    'lr': 1e-3,
-    'pde_points': 8000,
-    'ic_points': 2000,
-}
+# Force CPU execution and limit threads for Streamlit Cloud stability
+torch.set_num_threads(2)
 
 # =====================================================
 # Numba-accelerated Phase Field Simulation Functions
@@ -259,7 +244,7 @@ class PhaseFieldSimulation:
         }
 
 # =====================================================
-# PINN Model Definition
+# Memory-Safe PINN Model Definition
 # =====================================================
 
 class CahnHilliardPINN(nn.Module):
@@ -267,8 +252,7 @@ class CahnHilliardPINN(nn.Module):
     
     def __init__(self, Lx: float, Ly: float, T_max: float, 
                  A: float, B: float, C: float, 
-                 kappa: float, M: float, 
-                 c0: float = 0.5, noise_amp: float = 0.01):
+                 kappa: float, M: float):
         super().__init__()
         self.Lx = Lx
         self.Ly = Ly
@@ -278,8 +262,6 @@ class CahnHilliardPINN(nn.Module):
         self.C = C
         self.kappa = kappa
         self.M = M
-        self.c0 = c0
-        self.noise_amp = noise_amp
         
         # Network architecture: Periodic embedding + MLP
         self.net = nn.Sequential(
@@ -398,14 +380,10 @@ def initial_condition_loss(model: CahnHilliardPINN,
     noise_y = torch.cos(4 * np.pi * x / model.Lx) * torch.sin(2 * np.pi * y / model.Ly)
     smooth_noise = 0.5 * (noise_x + noise_y)
     
-    c_target = model.c0 + model.noise_amp * smooth_noise
+    c_target = 0.5 + 0.05 * smooth_noise
     c_pred = model(x, y, torch.zeros_like(x))
     
     return torch.mean((c_pred - c_target)**2)
-
-# =====================================================
-# PINN Training Functions
-# =====================================================
 
 def generate_collocation_points(pde_points: int, ic_points: int,
                               Lx: float, Ly: float, T_max: float) -> Dict[str, torch.Tensor]:
@@ -424,49 +402,50 @@ def generate_collocation_points(pde_points: int, ic_points: int,
         'x_ic': x_ic, 'y_ic': y_ic
     }
 
-def train_pinn_model(params: Dict, 
-                    progress_callback=None,
-                    status_callback=None) -> Tuple[Optional[CahnHilliardPINN], Dict]:
-    """Train the PINN model with comprehensive loss tracking."""
-    logger.info(f"Starting PINN training with parameters: {params}")
+# =====================================================
+# MEMORY-SAFE TRAINING FUNCTION (KEY COMPONENT)
+# =====================================================
+
+def train_pinn_safe(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Train PINN in complete isolation. Returns ONLY safe, graph-free data.
+    No tensors with grad_fn are returned.
+    """
+    device = torch.device('cpu')  # Critical for Streamlit Cloud
     
-    # Extract parameters
+    # Apply safety caps to prevent OOM
+    pde_points = min(params.get('pde_points', 4000), 5000)
+    ic_points = min(params.get('ic_points', 1500), 2000)
+    epochs = min(params.get('epochs', 2000), 3000)
+    T_max = min(params.get('T_max', 30.0), 40.0)
+    
     Lx = params['Lx']
     Ly = params['Ly']
-    T_max = params['T_max']
     W = params['W']
     kappa = params['kappa']
     M = params['M']
-    c0 = params['c0']
-    noise_amp = params['noise_amp']
-    epochs = params['epochs']
-    lr = params['lr']
-    pde_points = params['pde_points']
-    ic_points = params['ic_points']
+    lr = params.get('lr', 1e-3)
     
     # Set up free energy coefficients (standard double-well)
     A = W
     B = -2.0 * W
     C = W
     
-    # Initialize model
+    # Initialize model and move to CPU
     model = CahnHilliardPINN(
         Lx=Lx, Ly=Ly, T_max=T_max,
         A=A, B=B, C=C,
-        kappa=kappa, M=M,
-        c0=c0, noise_amp=noise_amp
-    )
+        kappa=kappa, M=M
+    ).to(device)
     
     # Generate collocation points
     points = generate_collocation_points(pde_points, ic_points, Lx, Ly, T_max)
+    points = {k: v.to(device) for k, v in points.items()}
     
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=500 #, verbose=False
-    )
     
-    # Loss history tracking
+    # Loss history (store ONLY scalars)
     loss_history = {
         'epochs': [],
         'total': [],
@@ -474,19 +453,16 @@ def train_pinn_model(params: Dict,
         'ic': []
     }
     
-    # Training loop
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        
-        try:
-            # PDE loss
+    start_time = time.time()
+    
+    try:
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            
+            # Compute PDE residual and losses
             residual = pde_residual(model, points['x_pde'], points['y_pde'], points['t_pde'])
-            pde_loss = torch.mean(residual**2)
-            
-            # Initial condition loss
+            pde_loss = torch.mean(residual ** 2)
             ic_loss = initial_condition_loss(model, points['x_ic'], points['y_ic'])
-            
-            # Total loss (IC weighted higher for better constraint)
             total_loss = pde_loss + 10.0 * ic_loss
             
             # Backward pass
@@ -496,45 +472,74 @@ def train_pinn_model(params: Dict,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
-            scheduler.step(total_loss)
             
-        except RuntimeError as e:
-            logger.error(f"Training failed at epoch {epoch}: {str(e)}")
-            if "out of memory" in str(e):
-                st.error("CUDA out of memory! Reduce collocation points or batch size.")
-            else:
-                st.error(f"Training error: {str(e)}")
-            return None, {}
+            # Store ONLY scalar values (no tensors!)
+            if (epoch + 1) % 100 == 0:
+                loss_history['epochs'].append(epoch + 1)
+                loss_history['total'].append(total_loss.item())      # ← .item() is critical
+                loss_history['pde'].append(pde_loss.item())
+                loss_history['ic'].append(ic_loss.item())
+            
+            # Explicitly delete tensors to free autograd graph
+            del residual, pde_loss, ic_loss, total_loss
         
-        # Log progress
-        if (epoch + 1) % 100 == 0:
-            loss_history['epochs'].append(epoch + 1)
-            loss_history['total'].append(total_loss.item())
-            loss_history['pde'].append(pde_loss.item())
-            loss_history['ic'].append(ic_loss.item())
-            
-            if progress_callback:
-                progress_callback((epoch + 1) / epochs)
-            if status_callback:
-                status_callback(
-                    f"Epoch {epoch + 1}/{epochs} | "
-                    f"Total: {total_loss.item():.6f} | "
-                    f"PDE: {pde_loss.item():.6f} | "
-                    f"IC: {ic_loss.item():.6f}"
-                )
+        training_time = time.time() - start_time
+        
+        # Extract model state as pure NumPy arrays (safe to store)
+        model_state = {}
+        for k, v in model.state_dict().items():
+            model_state[k] = v.detach().cpu().numpy()
+        
+        # Explicit cleanup
+        del model, points, optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return {
+            "success": True,
+            "model_state": model_state,
+            "loss_history": loss_history,
+            "training_time": training_time,
+            "params": params
+        }
     
-    logger.info("PINN training completed successfully")
-    return model, loss_history
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        return {"error": str(e)}
 
 # =====================================================
-# PINN Evaluation & Visualization
+# MEMORY-SAFE EVALUATION FUNCTIONS
 # =====================================================
 
-def evaluate_pinn_solution(model: CahnHilliardPINN, 
-                         times: np.ndarray,
-                         nx: int = 128, ny: int = 128) -> Dict:
-    """Evaluate the trained PINN on a regular grid for visualization."""
-    Lx, Ly = model.Lx, model.Ly
+def load_pinn_model(model_state: Dict[str, np.ndarray], params: Dict[str, Any]) -> CahnHilliardPINN:
+    """Reconstruct model from safe NumPy state dict."""
+    A = params['W']
+    B = -2.0 * params['W']
+    C = params['W']
+    
+    model = CahnHilliardPINN(
+        params['Lx'], params['Ly'], params['T_max'],
+        A, B, C, params['kappa'], params['M']
+    )
+    
+    # Load state dict from NumPy arrays
+    state_dict = {}
+    for k, v in model_state.items():
+        state_dict[k] = torch.from_numpy(v)
+    model.load_state_dict(state_dict)
+    
+    return model
+
+def evaluate_pinn_safe(model_state: Dict[str, np.ndarray], params: Dict[str, Any], times: np.ndarray) -> Dict[str, Any]:
+    """Evaluate the trained PINN on a grid without creating computation graphs."""
+    model = load_pinn_model(model_state, params)
+    model.eval()
+    
+    # Use lower resolution for memory safety
+    nx = min(params.get('nx', 96), 128)
+    ny = min(params.get('ny', 96), 128)
+    Lx = params['Lx']
+    Ly = params['Ly']
     
     # Create evaluation grid
     x = torch.linspace(0, Lx, nx)
@@ -544,424 +549,248 @@ def evaluate_pinn_solution(model: CahnHilliardPINN,
     c_solutions = []
     free_energy_solutions = []
     
-    for t_val in times:
-        # Prepare time tensor
-        t = torch.full((X.numel(), 1), t_val, dtype=torch.float32)
-        
-        # Evaluate concentration
-        with torch.no_grad():
-            c_pred = model(
-                X.reshape(-1, 1), 
-                Y.reshape(-1, 1), 
-                t
-            )
+    # Evaluate at each time step
+    with torch.no_grad():  # ← Critical: no autograd graph
+        for t_val in times:
+            t = torch.full((X.numel(), 1), t_val, dtype=torch.float32)
+            c_pred = model(X.reshape(-1, 1), Y.reshape(-1, 1), t)
             c = c_pred.reshape(nx, ny).cpu().numpy()
             c_solutions.append(c)
             
             # Compute free energy density
-            A, B, C = model.A, model.B, model.C
+            A = params['W']
+            B = -2.0 * params['W']
+            C = params['W']
             energy = A * c**2 + B * c**3 + C * c**4
             free_energy_solutions.append(energy)
     
     return {
-        'X': X.cpu().numpy(),
-        'Y': Y.cpu().numpy(),
         'c_solutions': c_solutions,
         'free_energy_solutions': free_energy_solutions,
         'times': times,
-        'params': {
-            'Lx': Lx, 'Ly': Ly, 'T_max': model.T_max,
-            'W': model.A, 'kappa': model.kappa, 'M': model.M,
-            'c0': model.c0, 'noise_amp': model.noise_amp
-        }
+        'params': params
     }
 
-def plot_pinn_losses(loss_history: Dict, output_dir: str) -> str:
-    """Plot training losses."""
-    plt.figure(figsize=(10, 6))
-    epochs = loss_history['epochs']
-    
-    plt.plot(epochs, loss_history['total'], 'k-', linewidth=2, label='Total Loss')
-    plt.plot(epochs, loss_history['pde'], 'b--', linewidth=1.5, label='PDE Loss')
-    plt.plot(epochs, loss_history['ic'], 'r-.', linewidth=1.5, label='IC Loss')
-    
-    plt.yscale('log')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('PINN Training Losses')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    
-    plot_path = os.path.join(output_dir, 'pinn_loss_plot.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    return plot_path
-
-def plot_pinn_concentration(solution: Dict, time_idx: int, output_dir: str) -> str:
-    """Plot concentration field at specific time."""
-    c = solution['c_solutions'][time_idx]
-    t_val = solution['times'][time_idx]
-    
-    plt.figure(figsize=(8, 7))
-    im = plt.imshow(c.T, cmap='bwr', origin='lower', 
-                    extent=[0, solution['params']['Lx'], 0, solution['params']['Ly']],
-                    vmin=0, vmax=1)
-    plt.colorbar(im, label='Concentration c')
-    plt.title(f'PINN Concentration Field (t = {t_val:.1f})')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.tight_layout()
-    
-    plot_path = os.path.join(output_dir, f'pinn_concentration_t{t_val:.1f}.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    return plot_path
-
-def plot_pinn_free_energy(solution: Dict, time_idx: int, output_dir: str) -> str:
-    """Plot free energy density at specific time."""
-    energy = solution['free_energy_solutions'][time_idx]
-    t_val = solution['times'][time_idx]
-    
-    plt.figure(figsize=(6, 5))
-    im = plt.imshow(energy.T, cmap='viridis', origin='lower',
-                    extent=[0, solution['params']['Lx'], 0, solution['params']['Ly']])
-    plt.colorbar(im, label='Free Energy Density')
-    plt.title(f'PINN Free Energy Density (t = {t_val:.1f})')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.tight_layout()
-    
-    plot_path = os.path.join(output_dir, f'pinn_energy_t{t_val:.1f}.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    return plot_path
-
-def plot_pinn_histogram(solution: Dict, time_idx: int, output_dir: str) -> str:
-    """Plot concentration histogram."""
-    c = solution['c_solutions'][time_idx]
-    t_val = solution['times'][time_idx]
-    
-    plt.figure(figsize=(6, 4))
-    plt.hist(c.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
-    plt.xlim(0, 1)
-    plt.xlabel('Concentration c')
-    plt.ylabel('Frequency')
-    plt.title(f'Concentration Distribution (t = {t_val:.1f})')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    plot_path = os.path.join(output_dir, f'pinn_histogram_t{t_val:.1f}.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    return plot_path
-
 # =====================================================
-# Streamlit PINN Integration
+# STREAMLIT USER INTERFACE
 # =====================================================
 
-def add_pinn_section():
-    """Add PINN section to the existing Streamlit app."""
-    st.header("🧠 Physics-Informed Neural Network (PINN)")
+def add_pinn_section_safe():
+    """Add the memory-safe PINN section to the Streamlit app."""
+    st.header("🧠 Physics-Informed Neural Network (PINN) - Memory Safe")
     st.markdown("""
-    This section uses a **mesh-free neural network** to solve the Cahn-Hilliard equation directly from physics.
-    No numerical discretization—just automatic differentiation and optimization!
+    This PINN solves the Cahn-Hilliard equation **without numerical discretization**.
+    All computation graphs are destroyed after training — safe for Streamlit Cloud!
     """)
     
-    # PINN parameters in sidebar
+    # Demo mode toggle (recommended for first-time users)
+    demo_mode = st.sidebar.checkbox("💡 Light Demo Mode (recommended)", True)
+    
     with st.sidebar:
         st.divider()
         st.subheader("🧠 PINN Parameters")
-        
-        pinn_epochs = st.number_input("Training epochs", 1000, 10000, 3000, 100)
-        pinn_lr = st.number_input("Learning rate", 1e-5, 1e-2, 1e-3, format="%.1e")
-        pde_points = st.number_input("PDE collocation points", 1000, 20000, 8000, 1000)
-        ic_points = st.number_input("IC points", 500, 5000, 2000, 500)
-        
-        st.info("💡 **Tip**: Start with fewer points for faster testing, then increase for accuracy.")
+        if demo_mode:
+            pinn_epochs = 1500
+            pde_points = 3500
+            st.info("Light mode: epochs=1500, PDE points=3500")
+        else:
+            pinn_epochs = st.number_input("Training epochs", 500, 5000, 2000, 100)
+            pde_points = st.number_input("PDE collocation points", 1000, 6000, 4500, 500)
     
-    # Get current simulation parameters
+    # Get current FDM parameters or use defaults
     if 'sim' in st.session_state:
         sim = st.session_state.sim
-        current_params = {
+        base_params = {
             'Lx': float(sim.dx * sim.nx),
             'Ly': float(sim.dx * sim.ny),
-            'T_max': DEFAULT_PARAMS['T_max'],  # Fixed for PINN
             'W': sim.W,
             'kappa': sim.kappa,
             'M': sim.M,
-            'c0': 0.5,  # Fixed for consistency
-            'noise_amp': 0.05,  # Fixed for consistency
-            'epochs': pinn_epochs,
-            'lr': pinn_lr,
-            'pde_points': pde_points,
-            'ic_points': ic_points,
-            'nx': DEFAULT_PARAMS['nx'],
-            'ny': DEFAULT_PARAMS['ny']
         }
     else:
-        current_params = DEFAULT_PARAMS.copy()
-        current_params.update({
-            'epochs': pinn_epochs,
-            'lr': pinn_lr,
-            'pde_points': pde_points,
-            'ic_points': ic_points
-        })
+        base_params = {'Lx': 60.0, 'Ly': 60.0, 'W': 1.0, 'kappa': 2.0, 'M': 1.0}
     
-    # PINN training button
-    if st.button("🚀 Train PINN Model", type="primary"):
-        with st.spinner("Training PINN... This may take several minutes."):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+    # Build full parameter set with safety limits
+    current_params = {
+        **base_params,
+        'T_max': 25.0 if demo_mode else 35.0,
+        'epochs': pinn_epochs,
+        'lr': 1e-3,
+        'pde_points': pde_points,
+        'ic_points': 1500,
+        'nx': 80 if demo_mode else 100,
+        'ny': 80 if demo_mode else 100
+    }
+    
+    st.info(f"Domain: {current_params['Lx']} × {current_params['Ly']} μm² | Simulation time: {current_params['T_max']} seconds")
+    
+    # Training button
+    if st.button("🚀 Train PINN (CPU Only)", type="primary"):
+        with st.spinner("Training PINN... This may take 1-5 minutes."):
+            result = train_pinn_safe(current_params)
             
-            def update_progress(progress):
-                progress_bar.progress(progress)
-            
-            def update_status(status):
-                status_text.text(status)
-            
-            try:
-                start_time = time.time()
-                model, loss_history = train_pinn_model(
-                    current_params,
-                    progress_callback=update_progress,
-                    status_callback=update_status
-                )
-                training_time = time.time() - start_time
-                
-                if model is None:
-                    st.error("PINN training failed!")
-                    return
-                
-                # Store results in session state
-                st.session_state.pinn_model = model
-                st.session_state.pinn_loss_history = loss_history
-                st.session_state.pinn_params = current_params
-                st.session_state.pinn_training_time = training_time
-                
-                st.success(f"✅ PINN training completed in {training_time:.1f} seconds!")
-                
-            except Exception as e:
-                logger.error(f"PINN training error: {str(e)}")
-                st.error(f"PINN training failed: {str(e)}")
-                return
+            if "error" in result:
+                st.error(f"Training failed: {result['error']}")
+            else:
+                st.session_state.pinn_result = result
+                st.success(f"✅ PINN training completed in {result['training_time']:.1f} seconds!")
     
     # Display results if available
-    if 'pinn_model' in st.session_state:
-        st.subheader("📊 PINN Results")
+    if 'pinn_result' in st.session_state:
+        result = st.session_state.pinn_result
         
-        # Training info
+        # Training metrics
         col1, col2, col3 = st.columns(3)
-        col1.metric("Training Time", f"{st.session_state.pinn_training_time:.1f}s")
-        col2.metric("Final PDE Loss", f"{st.session_state.pinn_loss_history['pde'][-1]:.2e}")
-        col3.metric("Final IC Loss", f"{st.session_state.pinn_loss_history['ic'][-1]:.2e}")
+        col1.metric("Training Time", f"{result['training_time']:.1f}s")
+        col2.metric("Final PDE Loss", f"{result['loss_history']['pde'][-1]:.2e}")
+        col3.metric("Final IC Loss", f"{result['loss_history']['ic'][-1]:.2e}")
         
-        # Loss plot
-        loss_plot_path = plot_pinn_losses(st.session_state.pinn_loss_history, OUTPUT_DIR)
-        st.image(loss_plot_path, caption="Training Losses")
+        # Loss history plot
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(result['loss_history']['epochs'], result['loss_history']['total'], 'k-', linewidth=2, label='Total Loss')
+        ax.plot(result['loss_history']['epochs'], result['loss_history']['pde'], 'b--', linewidth=1.5, label='PDE Loss')
+        ax.plot(result['loss_history']['epochs'], result['loss_history']['ic'], 'r-.', linewidth=1.5, label='IC Loss')
+        ax.set_yscale('log')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('PINN Training Losses')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        st.pyplot(fig)
+        plt.close()
         
-        # Evaluate solution
-        with st.spinner("Evaluating PINN solution..."):
-            times_to_evaluate = np.linspace(0, current_params['T_max'], 10)
-            pinn_solution = evaluate_pinn_solution(
-                st.session_state.pinn_model,
-                times_to_evaluate,
-                nx=current_params['nx'],
-                ny=current_params['ny']
+        # Evaluation button
+        if st.button("🔍 Evaluate Solution at Multiple Times"):
+            with st.spinner("Evaluating PINN solution..."):
+                times = np.linspace(0, result['params']['T_max'], 8)
+                solution = evaluate_pinn_safe(result['model_state'], result['params'], times)
+                st.session_state.pinn_solution = solution
+                st.success("Evaluation complete! Scroll down to view results.")
+        
+        # Display solution if available
+        if 'pinn_solution' in st.session_state:
+            sol = st.session_state.pinn_solution
+            time_idx = st.slider(
+                "Select time step", 
+                0, len(sol['times']) - 1, 
+                len(sol['times']) - 1,
+                format="t = %.1f s"
             )
-            st.session_state.pinn_solution = pinn_solution
-        
-        # Final time visualization
-        final_idx = -1
-        conc_plot = plot_pinn_concentration(pinn_solution, final_idx, OUTPUT_DIR)
-        energy_plot = plot_pinn_free_energy(pinn_solution, final_idx, OUTPUT_DIR)
-        hist_plot = plot_pinn_histogram(pinn_solution, final_idx, OUTPUT_DIR)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(conc_plot, caption="Concentration Field")
-        with col2:
-            st.image(energy_plot, caption="Free Energy Density")
-        
-        st.image(hist_plot, caption="Concentration Distribution")
-        
-        # Time series animation
-        st.subheader("🎬 Time Evolution")
-        time_slider = st.slider(
-            "Select time step", 
-            0, len(times_to_evaluate)-1, 
-            len(times_to_evaluate)-1,
-            format="t = %.1f"
-        )
-        
-        if time_slider != final_idx:
-            conc_plot_ts = plot_pinn_concentration(pinn_solution, time_slider, OUTPUT_DIR)
-            energy_plot_ts = plot_pinn_free_energy(pinn_solution, time_slider, OUTPUT_DIR)
-            hist_plot_ts = plot_pinn_histogram(pinn_solution, time_slider, OUTPUT_DIR)
+            t_val = sol['times'][time_idx]
             
+            c = sol['c_solutions'][time_idx]
+            energy = sol['free_energy_solutions'][time_idx]
+            
+            # Concentration and energy plots
             col1, col2 = st.columns(2)
             with col1:
-                st.image(conc_plot_ts, caption=f"Concentration (t = {times_to_evaluate[time_slider]:.1f})")
+                fig1, ax1 = plt.subplots(figsize=(6, 5))
+                im1 = ax1.imshow(c.T, cmap='bwr', origin='lower', vmin=0, vmax=1)
+                ax1.set_title(f"PINN Concentration (t = {t_val:.1f}s)")
+                ax1.set_xlabel("x")
+                ax1.set_ylabel("y")
+                plt.colorbar(im1, ax=ax1, label="Concentration c")
+                st.pyplot(fig1)
+                plt.close()
             with col2:
-                st.image(energy_plot_ts, caption=f"Free Energy (t = {times_to_evaluate[time_slider]:.1f})")
-            st.image(hist_plot_ts, caption=f"Concentration Distribution (t = {times_to_evaluate[time_slider]:.1f})")
-        
-        # Download section
-        st.subheader("💾 Download PINN Results")
-        
-        # Save model
-        model_path = os.path.join(OUTPUT_DIR, 'pinn_model.pth')
-        torch.save(st.session_state.pinn_model.state_dict(), model_path)
-        
-        with open(model_path, 'rb') as f:
+                fig2, ax2 = plt.subplots(figsize=(6, 5))
+                im2 = ax2.imshow(energy.T, cmap='viridis', origin='lower')
+                ax2.set_title(f"PINN Free Energy (t = {t_val:.1f}s)")
+                ax2.set_xlabel("x")
+                ax2.set_ylabel("y")
+                plt.colorbar(im2, ax=ax2, label="Energy Density")
+                st.pyplot(fig2)
+                plt.close()
+            
+            # Concentration histogram
+            fig3, ax3 = plt.subplots(figsize=(6, 3))
+            ax3.hist(c.flatten(), bins=40, alpha=0.7, color='steelblue', edgecolor='black')
+            ax3.set_xlim(0, 1)
+            ax3.set_xlabel("Concentration c")
+            ax3.set_ylabel("Frequency")
+            ax3.set_title(f"Concentration Distribution (t = {t_val:.1f}s)")
+            ax3.grid(True, alpha=0.3)
+            st.pyplot(fig3)
+            plt.close()
+            
+            # Download section
+            st.subheader("💾 Download PINN Results")
+            
+            # Solution data
+            solution_bytes = pickle.dumps(sol)
             st.download_button(
-                "📥 Download Trained Model",
-                f.read(),
-                "pinn_model.pth",
-                "application/octet-stream"
-            )
-        
-        # Save solution
-        solution_path = os.path.join(OUTPUT_DIR, 'pinn_solution.pkl')
-        with open(solution_path, 'wb') as f:
-            pickle.dump(pinn_solution, f)
-        
-        with open(solution_path, 'rb') as f:
-            st.download_button(
-                "📥 Download Solution Data",
-                f.read(),
+                "📥 Download Solution Data (Pickle)",
+                solution_bytes,
                 "pinn_solution.pkl",
                 "application/octet-stream"
             )
-        
-        # Save loss history
-        loss_history_path = os.path.join(OUTPUT_DIR, 'pinn_loss_history.pkl')
-        with open(loss_history_path, 'wb') as f:
-            pickle.dump(st.session_state.pinn_loss_history, f)
-        
-        with open(loss_history_path, 'rb') as f:
+            
+            # Loss history
+            loss_bytes = pickle.dumps(result['loss_history'])
             st.download_button(
-                "📥 Download Loss History",
-                f.read(),
+                "📥 Download Loss History (Pickle)",
+                loss_bytes,
                 "pinn_loss_history.pkl",
                 "application/octet-stream"
             )
 
 # =====================================================
-# Original Streamlit App (with PINN integration)
+# MAIN APPLICATION
 # =====================================================
 
 def main():
     st.set_page_config(
-        page_title="Phase Field Simulation",
+        page_title="Phase Field + PINN Simulation",
         page_icon="🔬",
         layout="wide"
     )
     
     # Title and description
-    st.title("🔬 Phase Field Simulation: Spinodal Decomposition")
+    st.title("🔬 Phase Field Simulation + Physics-Informed Neural Network")
     st.markdown("""
-    This interactive simulation demonstrates **phase decomposition** using the Cahn-Hilliard equation.
-    Adjust parameters to see how they affect phase separation dynamics.
+    **Top section**: Traditional finite-difference solver (fast, robust).  
+    **Bottom section**: Mesh-free PINN that learns directly from physics (no data required).
     """)
     
-    # Initialize simulation in session state
+    # Initialize FDM simulator in session state
     if 'sim' not in st.session_state:
         st.session_state.sim = PhaseFieldSimulation(nx=256, ny=256, dx=1.0, dt=0.1)
         st.session_state.sim.initialize_random(c0=0.5, noise_amplitude=0.05)
     
     sim = st.session_state.sim
     
-    # Sidebar for controls
+    # Sidebar controls for FDM
     with st.sidebar:
-        st.header("🎛️ Simulation Controls")
+        st.header("🎛️ FDM Controls")
         
-        st.subheader("Simulation Parameters")
         steps_to_run = st.number_input("Steps per update", min_value=1, max_value=1000, value=10)
         
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Run Steps", use_container_width=True):
-                with st.spinner("Running simulation..."):
+            if st.button("▶️ Run FDM Steps", use_container_width=True):
+                with st.spinner("Running finite-difference simulation..."):
                     sim.run_steps(steps_to_run)
         
         with col2:
-            if st.button("⏹️ Stop", use_container_width=True):
+            if st.button("🔄 Reset FDM", use_container_width=True):
+                sim.initialize_random(c0=0.5, noise_amplitude=0.05)
                 st.rerun()
         
-        if st.button("🔄 Reset Random", use_container_width=True):
-            sim.initialize_random(c0=0.5, noise_amplitude=0.05)
-            st.rerun()
-        
-        if st.button("🌱 Reset Seed", use_container_width=True):
-            sim.initialize_seed(c0=0.3, seed_value=0.7, radius=15)
-            st.rerun()
-        
         st.divider()
-        
-        st.subheader("Free Energy Parameters")
-        
-        use_standard_double_well = st.checkbox("Use standard double-well (f(c)=W*c²(1-c)²)", value=True)
-        
-        if use_standard_double_well:
-            W = st.slider("Double-well height (W)", 0.1, 5.0, 1.0, 0.1,
-                         help="Controls barrier between phases. Higher = sharper interfaces.")
-            sim.set_parameters(W=W, A=None, B=None, C=None)
-        else:
-            colA, colB, colC = st.columns(3)
-            with colA:
-                A = st.slider("A coefficient", 0.1, 5.0, 1.0, 0.1)
-            with colB:
-                B = st.slider("B coefficient", -5.0, 0.0, -2.0, 0.1)
-            with colC:
-                C = st.slider("C coefficient", 0.1, 5.0, 1.0, 0.1)
-            sim.set_parameters(A=A, B=B, C=C)
-        
-        st.divider()
-        
-        st.subheader("Physical Parameters")
+        st.subheader("FDM Parameters")
+        W = st.slider("Double-well height (W)", 0.1, 5.0, 1.0, 0.1,
+                     help="Controls energy barrier between phases")
         kappa = st.slider("Gradient coefficient (κ)", 0.1, 10.0, 2.0, 0.1,
-                         help="Controls interface width. Higher = wider interfaces.")
+                         help="Controls interface width")
         M = st.slider("Mobility (M)", 0.01, 5.0, 1.0, 0.01,
-                     help="Controls kinetics. Higher = faster phase separation.")
-        dt = st.slider("Time step (Δt)", 0.01, 0.5, 0.1, 0.01,
-                      help="Numerical time step. Too large may cause instability.")
-        
-        sim.kappa = kappa
-        sim.M = M
-        sim.dt = dt
-        
-        st.divider()
-        
-        st.subheader("Initial Conditions")
-        c0 = st.slider("Average concentration", 0.1, 0.9, 0.5, 0.01,
-                      help="Initial average concentration of the system.")
-        noise = st.slider("Noise amplitude", 0.001, 0.1, 0.05, 0.001,
-                         help="Initial random fluctuations.")
-        
-        if st.button("Apply Initial Conditions", use_container_width=True):
-            sim.initialize_random(c0=c0, noise_amplitude=noise)
-            st.rerun()
-        
-        st.divider()
-        
-        # Display statistics
-        stats = sim.get_statistics()
-        st.subheader("📊 Current Statistics")
-        st.metric("Time", f"{stats['time']:.1f}")
-        st.metric("Step", f"{stats['step']}")
-        st.metric("Mean Concentration", f"{stats['mean_concentration']:.4f}")
-        st.metric("Std Dev", f"{stats['std_concentration']:.4f}")
-        st.metric("High Phase Fraction", f"{stats['phase_fraction_high']:.3f}")
-        st.metric("Low Phase Fraction", f"{stats['phase_fraction_low']:.3f}")
+                     help="Controls phase separation speed")
+        sim.set_parameters(W=W, kappa=kappa, M=M)
     
-    # Main content area
+    # Main FDM visualization
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("Concentration Field")
-        
-        # Create figure for concentration field
+        st.subheader("Finite-Difference Simulation")
         fig1, ax1 = plt.subplots(figsize=(8, 7))
         im1 = ax1.imshow(sim.c, cmap='bwr', origin='lower', vmin=0, vmax=1)
         ax1.set_title(f"Concentration Field (t = {sim.time:.1f})")
@@ -969,12 +798,10 @@ def main():
         ax1.set_ylabel("y")
         plt.colorbar(im1, ax=ax1, label="Concentration c")
         st.pyplot(fig1)
-        plt.close(fig1)
+        plt.close()
     
     with col2:
-        st.subheader("Free Energy Density")
-        
-        # Create figure for free energy
+        st.subheader("FDM Free Energy Density")
         energy = sim.compute_free_energy_density()
         fig2, ax2 = plt.subplots(figsize=(5, 4))
         im2 = ax2.imshow(energy, cmap='viridis', origin='lower')
@@ -983,10 +810,10 @@ def main():
         ax2.set_ylabel("y")
         plt.colorbar(im2, ax=ax2, label="Energy Density")
         st.pyplot(fig2)
-        plt.close(fig2)
+        plt.close()
         
-        # Histogram
-        st.subheader("Concentration Distribution")
+        # FDM histogram
+        st.subheader("FDM Concentration Distribution")
         fig3, ax3 = plt.subplots(figsize=(5, 3))
         ax3.hist(sim.c.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
         ax3.set_xlim(0, 1)
@@ -995,13 +822,12 @@ def main():
         ax3.set_title("Histogram")
         ax3.grid(True, alpha=0.3)
         st.pyplot(fig3)
-        plt.close(fig3)
+        plt.close()
     
-    # Time series plots
-    st.subheader("📈 Time Evolution")
-    
+    # FDM time evolution plots
     if len(sim.history['time']) > 1:
-        fig4, axes = plt.subplots(1, 3, figsize=(15, 4))
+        st.subheader("FDM Time Evolution")
+        fig4, axes = plt.subplots(1, 2, figsize=(12, 4))
         
         # Mean concentration
         axes[0].plot(sim.history['time'], sim.history['mean'], 'b-', linewidth=2)
@@ -1017,137 +843,18 @@ def main():
         axes[1].set_title("Standard Deviation vs Time")
         axes[1].grid(True, alpha=0.3)
         
-        # Phase fractions
-        axes[2].plot(sim.history['time'], sim.history['phase_high'], 'g-', 
-                    label='High phase (c > 0.5)', linewidth=2)
-        axes[2].plot(sim.history['time'], sim.history['phase_low'], 'orange', 
-                    label='Low phase (c < 0.5)', linewidth=2)
-        axes[2].set_xlabel("Time")
-        axes[2].set_ylabel("Phase Fraction")
-        axes[2].set_title("Phase Fractions vs Time")
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3)
-        
         plt.tight_layout()
         st.pyplot(fig4)
-        plt.close(fig4)
+        plt.close()
     
-    # Export data section
     st.divider()
-    st.subheader("💾 Export Data")
     
-    col_exp1, col_exp2 = st.columns(2)
-    
-    with col_exp1:
-        if st.button("Save Current State as PNG"):
-            fig, ax = plt.subplots(figsize=(10, 8))
-            im = ax.imshow(sim.c, cmap='bwr', origin='lower', vmin=0, vmax=1)
-            ax.set_title(f"Phase Field Simulation - Time = {sim.time:.1f}")
-            plt.colorbar(im, ax=ax, label="Concentration")
-            
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            
-            st.download_button(
-                label="Download PNG",
-                data=buf.getvalue(),
-                file_name=f"phase_field_t{sim.time:.1f}.png",
-                mime="image/png"
-            )
-    
-    with col_exp2:
-        if st.button("Save Statistics as CSV"):
-            # Create CSV data
-            csv_data = "time,mean_concentration,std_concentration,phase_fraction_high,phase_fraction_low\n"
-            for i in range(len(sim.history['time'])):
-                csv_data += f"{sim.history['time'][i]},{sim.history['mean'][i]},{sim.history['std'][i]},{sim.history['phase_high'][i]},{sim.history['phase_low'][i]}\n"
-            
-            st.download_button(
-                label="Download CSV",
-                data=csv_data,
-                file_name="phase_field_statistics.csv",
-                mime="text/csv"
-            )
-    
-    # Information section
-    with st.expander("ℹ️ About this Simulation"):
-        st.markdown("""
-        ## Phase Field Method for Spinodal Decomposition
-        
-        This simulation implements the **Cahn-Hilliard equation** to model phase separation in binary systems:
-        
-        ```
-        ∂c/∂t = ∇·[M ∇μ]
-        μ = df/dc - κ∇²c
-        f(c) = A·c² + B·c³ + C·c⁴
-        ```
-        
-        ### Key Parameters:
-        
-        **Double-well free energy (f(c))**:
-        - **W** or **A, B, C**: Controls the energy barrier between phases
-        - Higher barrier → sharper interfaces, stronger phase separation
-        
-        **Gradient coefficient (κ)**:
-        - Controls interface width and energy
-        - Higher κ → wider interfaces, higher interfacial energy
-        
-        **Mobility (M)**:
-        - Controls kinetics of phase separation
-        - Higher M → faster evolution
-        
-        ### Physical Interpretation:
-        
-        1. **Spinodal Decomposition**: When initialized with random fluctuations (average c=0.5), 
-           the system undergoes spontaneous phase separation into interconnected patterns.
-        
-        2. **Nucleation and Growth**: When initialized with a seed (Reset Seed button), 
-           a nucleus of the high-concentration phase grows in the low-concentration matrix.
-        
-        3. **Phase Coarsening**: Over time, smaller domains merge to form larger ones,
-           reducing interfacial energy.
-        
-        ### Applications:
-        - Binary alloys phase separation
-        - Polymer blends
-        - Battery electrode materials (LiFePO₄)
-        - Pattern formation in materials science
-        """)
-    
-    # Auto-run option
-    st.sidebar.divider()
-    auto_run = st.sidebar.checkbox("Auto-run simulation", value=False)
-    auto_steps = st.sidebar.slider("Auto-run steps per second", 1, 100, 10)
-    
-    if auto_run:
-        placeholder = st.empty()
-        stop_button = st.sidebar.button("Stop Auto-run")
-        
-        if not stop_button:
-            with placeholder.container():
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i in range(auto_steps):
-                    if stop_button:
-                        break
-                    
-                    sim.run_step()
-                    progress_bar.progress((i + 1) / auto_steps)
-                    status_text.text(f"Running step {sim.step}...")
-                    
-                    # Update display every 5 steps
-                    if (i + 1) % 5 == 0:
-                        st.rerun()
-                
-                st.rerun()
-    
-    # ==============================
-    # ADD PINN SECTION HERE
-    # ==============================
-    st.divider()
-    add_pinn_section()
+    # Add the PINN section
+    add_pinn_section_safe()
+
+# =====================================================
+# ENTRY POINT
+# =====================================================
 
 if __name__ == "__main__":
     main()
