@@ -38,3 +38,8 @@
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition10-streamlit-red)](https://electrode-phasedecomposition10.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based simulation, advanced form of S4, coupling with electric field, BV and MHC electrochemical kinetics, C-rate information as input)
 
 
+# Hybrid FDM-PINN and Data Assimilation 
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn1-streamlit-red)](https://physics-informed-electrochemical-phase-field-model1.streamlit.app/) (Basic)
+
+
+
