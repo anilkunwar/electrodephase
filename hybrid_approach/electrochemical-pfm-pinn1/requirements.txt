@@ -8,3 +8,6 @@ meshio
 cupy-cuda12x  # For CUDA 11.x pip install cupy-cuda11x
 imageio
 imageio-ffmpeg
+torch
+seaborn
+
