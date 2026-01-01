@@ -10,3 +10,7 @@ imageio
 imageio-ffmpeg
 torch
 seaborn
+scikit-learn
+h5py
+openpyxl
+tqdm
