@@ -42,11 +42,13 @@
 # Hybrid FDM-PINN and Data Assimilation 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn1a-streamlit-red)](https://physics-informed-electrochemical-phase-field-model1.streamlit.app/) (Basic)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn1b-streamlit-red)](https://physics-informed-electrochemical-pfm1.streamlit.app/) (Basic R1, Numerical Computation)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn1b-streamlit-red)](https://physics-informed-electrochemical-pfm1.streamlit.app/) (Basic Type1, Numerical Computation)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn2b-streamlit-red)](https://physics-informed-electrochemical-pfm2.streamlit.app/) (Advanced, Numerical Computation and Visualization)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn2b-streamlit-red)](https://physics-informed-electrochemical-pfm2.streamlit.app/) (Advanced Type2, Numerical Computation and Visualization)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn3b-streamlit-red)](https://physics-informed-electrochemical-pfm3.streamlit.app/) (Advanced R1, Numerical Computation of Electrochemical Model)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn3b-streamlit-red)](https://physics-informed-electrochemical-pfm3.streamlit.app/) (Advanced Type1, Numerical Computation of Electrochemical Model)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn3b-streamlit-red)](https://physics-informed-electrochemical-pfm3.streamlit.app/) (A short concise code Type1 to test the simulation workability)
 
 
 
