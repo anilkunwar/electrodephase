@@ -1292,9 +1292,6 @@ class EnhancedPINNAssimilationTrainer:
                 features[feat_name] = feat_values
         
         # Create data loader
-        if features is not None:
-            # Create dataset with features
-            dataset = []  # This would be a custom dataset in a full implementation
         dataset = TensorDataset(x_obs, y_obs, c_obs)
         dataloader = DataLoader(dataset, batch_size=min(batch_size, len(x_obs)), shuffle=True)
         
