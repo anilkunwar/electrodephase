@@ -2017,4 +2017,4 @@ def main():
             with st.expander("⚡ Governing Equations", expanded=False):
                 st.markdown("""
                 ### Extended Cahn-Hilliard with Electrostatics
-                **Free Energy Density:**
+                **Free Energy Density:**""")
