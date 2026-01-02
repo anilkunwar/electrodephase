@@ -1985,34 +1985,4 @@ def main():
                     )
         else:
             st.info("Run assimilation cycles to see performance analysis here.")
-    with tab4:
-        # Documentation
-        st.subheader("📚 Documentation & Theory")
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            with st.expander("🧠 How It Works", expanded=True):
-                st.markdown("""
-                ### Hybrid FDM-PINN Assimilation Workflow
-                1. **FDM Forward Simulation**
-                    - Physics-based Cahn-Hilliard with electrostatics
-                    - Models LiFePO₄ phase separation under electric fields
-                    - Includes C-rate effects and **selectable kinetics models (PNP/BV/MHC)**
-                2. **Sparse Observation Generation**
-                    - Mimics real experimental data (microscopy, XRD, etc.)
-                    - 5-20% spatial coverage typical of real measurements
-                    - Adds realistic measurement noise
-                3. **Lightweight PINN Correction**
-                    - Small neural network trained only at observation times
-                    - Interpolates sparse data with physics constraints
-                    - Enforces chemical potential equilibrium at interfaces
-                4. **Sequential State Correction**
-                    - PINN reconstruction corrects FDM state
-                    - Damped correction for stability
-                    - Continue FDM simulation from corrected state
-                5. **Iterative Improvement**
-                    - Repeat at each observation time
-                    - System learns from accumulating data
-                    - Adaptive to changing conditions
-                """)
-            with st.expander("⚡ Governing Equations", expanded=False):
-                st.markdown("### Extended Cahn-Hilliard with Electrostatics **Free Energy Density:**")
+   
