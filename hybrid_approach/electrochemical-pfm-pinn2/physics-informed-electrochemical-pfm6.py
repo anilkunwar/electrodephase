@@ -1076,8 +1076,8 @@ class EnhancedSyntheticObservationGenerator:
     
     def build_synthetic_graph(
         self, 
-        cfield: np.ndarray, 
-        obs_ Dict, 
+        c_field: np.ndarray, 
+        obs_data: Dict, 
         nx: int, 
         ny: int,
         features: Dict[str, np.ndarray]
@@ -1086,7 +1086,7 @@ class EnhancedSyntheticObservationGenerator:
         G = nx.Graph()
         
         # Add nodes for each grid cell with phase information
-        phase_mask = (cfield > 0.5).astype(int)  # LiFePO4=1, FePO4=0
+        phase_mask = (c_field > 0.5).astype(int)  # LiFePO4=1, FePO4=0
         
         for i in range(nx):
             for j in range(ny):
@@ -1094,7 +1094,7 @@ class EnhancedSyntheticObservationGenerator:
                 G.add_node(node_id, 
                            type='grid_cell',
                            phase=phase_mask[i,j],
-                           c=cfield[i,j],
+                           c=c_field[i,j],
                            pos=(i, j),
                            grain_boundary=features['grains'][i,j] if 'grains' in features else 0,
                            porosity=features['porosity'][i,j] if 'porosity' in features else 0,
@@ -1265,7 +1265,7 @@ class EnhancedPINNAssimilationTrainer:
     
     def train(
         self,
-        obs_ Dict,
+        obs_data: Dict,
         phi_field: np.ndarray,
         sim_params: Dict,
         n_epochs: int = 500,
@@ -1534,7 +1534,7 @@ class HybridFDMPINNAssimilation:
         with st.spinner("Reconstructing full concentration field..."):
             # Extract feature fields for reconstruction
             feature_fields = {}
-            if use_graph_features and 'features' in obs_
+            if use_graph_features and 'features' in obs_data:
                 for feat_name, feat_vals in obs_data['features'].items():
                     # Create empty field and fill with feature values
                     feat_field = np.zeros((self.sim.nx, self.sim.ny))
