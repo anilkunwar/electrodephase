@@ -2015,6 +2015,6 @@ def main():
                     - Adaptive to changing conditions
                 """)
             with st.expander("⚡ Governing Equations", expanded=False):
-                st.markdown("""
+                st.markdown("
                 ### Extended Cahn-Hilliard with Electrostatics
-                **Free Energy Density:**""")
+                **Free Energy Density:**")
