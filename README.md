@@ -58,5 +58,9 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn8b-streamlit-red)](https://physics-informed-electrochemical-pfm8.streamlit.app/) (Robust code Type1 with comparison to TEM-like synthetic data)
 
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn9b-streamlit-red)](https://physics-informed-electrochemical-pfm9.streamlit.app/) (Robust code Type1 with comparison to more options -like synthetic data)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn10b-streamlit-red)](https://physics-informed-electrochemical-pfm10.streamlit.app/) (Robust code Type1 with comparison to more TEM -like synthetic data, Numba acceleration)
+
 
 
