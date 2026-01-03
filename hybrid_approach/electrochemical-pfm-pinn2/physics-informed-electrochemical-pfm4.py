@@ -2747,8 +2747,10 @@ def plot_technique_specific_artifacts(obs_data: Dict) -> go.Figure:
             header=dict(values=['Parameter', 'Value'],
                        fill_color='paleturquoise',
                        align='left'),
-            cells=dict(values=[row[0] for row in table_data], 
-                      [row[1] for row in table_data],
+            cells=dict(values=[
+                           [row[0] for row in table_data], 
+                           [row[1] for row in table_data]
+                        ],
                       fill_color='lavender',
                       align='left'),
             columnwidth=[0.3, 0.7]
