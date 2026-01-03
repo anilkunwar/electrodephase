@@ -56,5 +56,7 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn7b-streamlit-red)](https://physics-informed-electrochemical-pfm7.streamlit.app/) (Robust code Type1 with workflow description)
 
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn8b-streamlit-red)](https://physics-informed-electrochemical-pfm8.streamlit.app/) (Robust code Type1 with comparison to TEM-like synthetic data)
+
 
 
