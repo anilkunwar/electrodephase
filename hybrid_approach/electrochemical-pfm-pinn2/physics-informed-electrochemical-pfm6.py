@@ -979,7 +979,7 @@ class EnhancedSyntheticObservationGenerator:
         if seed is not None:
             np.random.seed(seed)
         
-        nx, ny = c_field.shape
+        nx_dim, ny_dim = c_field.shape  # Renamed to avoid conflict with networkx alias
         config = self.observation_types[observation_type].copy()
         # Override with custom values if provided
         if custom_coverage is not None:
@@ -990,23 +990,23 @@ class EnhancedSyntheticObservationGenerator:
         # Generate nanoscale features
         features = {}
         for feat_name, feat_func in self.features.items():
-            features[feat_name] = feat_func(c_field, nx, ny)
+            features[feat_name] = feat_func(c_field, nx_dim, ny_dim)
         
         # Generate observation locations based on pattern
         obs_i, obs_j = [], []
         
         if config['pattern'] == 'random':
-            n_obs = max(1, int(config['coverage'] * nx * ny))
-            obs_indices = np.random.choice(nx * ny, n_obs, replace=False)
-            obs_i = obs_indices // ny
-            obs_j = obs_indices % ny
+            n_obs = max(1, int(config['coverage'] * nx_dim * ny_dim))
+            obs_indices = np.random.choice(nx_dim * ny_dim, n_obs, replace=False)
+            obs_i = obs_indices // ny_dim
+            obs_j = obs_indices % ny_dim
         
         elif config['pattern'] == 'grid':
             # Regular grid sampling for XRD mapping
             step = max(1, int(1 / np.sqrt(config['coverage'])))
             obs_i, obs_j = np.meshgrid(
-                np.arange(0, nx, step),
-                np.arange(0, ny, step),
+                np.arange(0, nx_dim, step),
+                np.arange(0, ny_dim, step),
                 indexing='ij'
             )
             obs_i = obs_i.flatten()
@@ -1014,29 +1014,29 @@ class EnhancedSyntheticObservationGenerator:
         
         elif config['pattern'] == 'lines':
             # Line scans for tomography
-            n_lines = max(1, int(np.sqrt(config['coverage'] * nx * ny / ny)))
-            line_indices = np.linspace(0, nx-1, n_lines).astype(int)
-            obs_i = np.repeat(line_indices, ny)
-            obs_j = np.tile(np.arange(ny), n_lines)
+            n_lines = max(1, int(np.sqrt(config['coverage'] * nx_dim * ny_dim / ny_dim)))
+            line_indices = np.linspace(0, nx_dim-1, n_lines).astype(int)
+            obs_i = np.repeat(line_indices, ny_dim)
+            obs_j = np.tile(np.arange(ny_dim), n_lines)
         
         elif config['pattern'] == 'surface_scan':
             # Surface-biased scan for AFM
-            n_obs = max(1, int(config['coverage'] * nx * ny))
+            n_obs = max(1, int(config['coverage'] * nx_dim * ny_dim))
             # Bias toward surface (first 25% of x-direction)
-            surface_mask = np.zeros((nx, ny), dtype=bool)
-            surface_mask[:max(1, nx//4), :] = True
+            surface_mask = np.zeros((nx_dim, ny_dim), dtype=bool)
+            surface_mask[:max(1, nx_dim//4), :] = True
             surface_indices = np.where(surface_mask.flatten())[0]
             if len(surface_indices) > 0:
                 obs_indices = np.random.choice(surface_indices, min(n_obs, len(surface_indices)), replace=False)
             else:
-                obs_indices = np.random.choice(nx * ny, n_obs, replace=False)
-            obs_i = obs_indices // ny
-            obs_j = obs_indices % ny
+                obs_indices = np.random.choice(nx_dim * ny_dim, n_obs, replace=False)
+            obs_i = obs_indices // ny_dim
+            obs_j = obs_indices % ny_dim
         
         # Ensure we have at least some observations
         if len(obs_i) == 0:
-            obs_i = np.array([nx//2])
-            obs_j = np.array([ny//2])
+            obs_i = np.array([nx_dim//2])
+            obs_j = np.array([ny_dim//2])
         
         # Add noise to observations
         c_obs = c_field[obs_i, obs_j]
@@ -1061,7 +1061,7 @@ class EnhancedSyntheticObservationGenerator:
             'x_idx': obs_i,
             'y_idx': obs_j,
             'noise_std': config['noise_std'],
-            'coverage': len(obs_i) / (nx * ny),
+            'coverage': len(obs_i) / (nx_dim * ny_dim),
             'observation_type': observation_type,
             'full_field': c_field,
             'features': feature_values
@@ -1069,7 +1069,7 @@ class EnhancedSyntheticObservationGenerator:
         
         if return_graph:
             # Build synthetic graph representation
-            graph = self.build_synthetic_graph(c_field, obs_data, nx, ny, features)
+            graph = self.build_synthetic_graph(c_field, obs_data, nx_dim, ny_dim, features)
             return obs_data, graph
         else:
             return obs_data
@@ -1078,18 +1078,18 @@ class EnhancedSyntheticObservationGenerator:
         self, 
         c_field: np.ndarray, 
         obs_data: Dict, 
-        nx: int, 
-        ny: int,
+        nx_dim: int,  # Renamed parameter
+        ny_dim: int,  # Renamed parameter
         features: Dict[str, np.ndarray]
     ) -> nx.Graph:
         """Build logical graph representation of microstructure and observations"""
-        G = nx.Graph()
+        G = nx.Graph()  # This now correctly refers to networkx.Graph()
         
         # Add nodes for each grid cell with phase information
         phase_mask = (c_field > 0.5).astype(int)  # LiFePO4=1, FePO4=0
         
-        for i in range(nx):
-            for j in range(ny):
+        for i in range(nx_dim):
+            for j in range(ny_dim):
                 node_id = f"cell_{i}_{j}"
                 G.add_node(node_id, 
                            type='grid_cell',
@@ -1101,14 +1101,14 @@ class EnhancedSyntheticObservationGenerator:
                            strain=features['strain'][i,j] if 'strain' in features else 0)
         
         # Add edges between adjacent cells (diffusion paths)
-        for i in range(nx-1):
-            for j in range(ny):
+        for i in range(nx_dim-1):
+            for j in range(ny_dim):
                 G.add_edge(f"cell_{i}_{j}", f"cell_{i+1}_{j}", 
                            type='diffusion_path', 
                            weight=1.0)
         
-        for i in range(nx):
-            for j in range(ny-1):
+        for i in range(nx_dim):
+            for j in range(ny_dim-1):
                 G.add_edge(f"cell_{i}_{j}", f"cell_{i}_{j+1}", 
                            type='diffusion_path', 
                            weight=1.0)
@@ -2378,7 +2378,7 @@ def main():
             # Create a sample concentration field
             sample_c = np.random.rand(50, 50) * 0.6 + 0.2
             obs_gen = EnhancedSyntheticObservationGenerator()
-            sample_obs, _ = obs_gen.generate_sparse_observations(
+            sample_obs, sample_graph = obs_gen.generate_sparse_observations(
                 sample_c, dx=1.0, L0=1.0,
                 observation_type='microscopy',
                 return_graph=True
@@ -2391,7 +2391,7 @@ def main():
         
         with col_obs2:
             st.markdown("**XRD Mapping Pattern**")
-            sample_obs_xrd, _ = obs_gen.generate_sparse_observations(
+            sample_obs_xrd, sample_graph_xrd = obs_gen.generate_sparse_observations(
                 sample_c, dx=1.0, L0=1.0,
                 observation_type='xrd_mapping',
                 return_graph=True
@@ -2609,8 +2609,11 @@ def main():
                     G = last_result['synthetic_graph']
                     
                     # Community detection to find grain clusters
-                    communities = list(nx.algorithms.community.greedy_modularity_communities(G))
-                    st.info(f"Found {len(communities)} grain clusters in the microstructure")
+                    try:
+                        communities = list(nx.algorithms.community.greedy_modularity_communities(G))
+                        st.info(f"Found {len(communities)} grain clusters in the microstructure")
+                    except:
+                        st.info("Could not perform community detection on this graph")
                     
                     # Plot feature distributions
                     col_f1, col_f2 = st.columns(2)
