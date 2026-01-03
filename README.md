@@ -52,7 +52,9 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn5b-streamlit-red)](https://physics-informed-electrochemical-pfm5.streamlit.app/) (Robust code Type1 with workflow description)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn6b-streamlit-red)](https://physics-informed-electrochemical-pfm6.streamlit.app/) (Robust code Type1 with workflow description)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn6b-streamlit-red)](https://physics-informed-electrochemical-pfm6.streamlit.app/) (Robust code Type1 with workflow description, Working code)
+
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn7b-streamlit-red)](https://physics-informed-electrochemical-pfm7.streamlit.app/) (Robust code Type1 with workflow description)
 
 
 
