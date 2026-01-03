@@ -48,7 +48,7 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn3b-streamlit-red)](https://physics-informed-electrochemical-pfm3.streamlit.app/) (Advanced Type1, Numerical Computation of Electrochemical Model)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn4b-streamlit-red)](https://physics-informed-electrochemical-pfm4.streamlit.app/) (A short concise code Type1 to test the simulation workability)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn4b-streamlit-red)](https://physics-informed-electrochemical-pfm4.streamlit.app/) (A short concise code Type1 to test the simulation workability, needs debugging)
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn5b-streamlit-red)](https://physics-informed-electrochemical-pfm5.streamlit.app/) (Robust code Type1 with workflow description)
 
@@ -60,9 +60,9 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn9b-streamlit-red)](https://physics-informed-electrochemical-pfm9.streamlit.app/) (Robust code Type1 with comparison to more options -like synthetic data)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn10b-streamlit-red)](https://physics-informed-electrochemical-pfm10.streamlit.app/) (Robust code Type1 with comparison to more TEM -like synthetic data, Numba acceleration)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn10b-streamlit-red)](https://physics-informed-electrochemical-pfm10.streamlit.app/) (Robust code Type1 with comparison to more TEM -like synthetic data, Numba acceleration, needs debugging)
 
-[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn11b-streamlit-red)](https://physics-informed-electrochemical-pfm11.streamlit.app/) (Robust code Type1 with comparison to more multioptions -like synthetic data, Numba acceleration)
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/fdmpinn11b-streamlit-red)](https://physics-informed-electrochemical-pfm11.streamlit.app/) (Robust code Type1 with comparison to more multioptions -like synthetic data, Numba acceleration, needs debugging)
 
 
 
