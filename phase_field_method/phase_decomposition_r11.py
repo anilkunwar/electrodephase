@@ -1187,7 +1187,7 @@ def main():
         fig_kin, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=100)
         
         # Plot 1: Mean concentration vs time
-        axes[0].plot(times_h, sim.history['mean'], 'b-', linewidth=2, label='⟨c⟩')
+        axes[0].plot(times_h, sim.history['mean'], color='blue', linestyle='-', linewidth=2, label='⟨c⟩')
         axes[0].axhline(0.5, color='gray', linestyle=':', linewidth=0.5)
         axes[0].set_xlabel("Time (hours)")
         axes[0].set_ylabel("Mean Li concentration")
@@ -1196,7 +1196,7 @@ def main():
         axes[0].legend(fontsize=9)
         
         # Plot 2: Order parameter (std dev) vs time
-        axes[1].plot(times_h, sim.history['std'], 'r-', linewidth=2, label='σ(c)')
+        axes[1].plot(times_h, sim.history['std'], color='red', linestyle='-', linewidth=2, label='σ(c)')
         axes[1].set_xlabel("Time (hours)")
         axes[1].set_ylabel("Standard deviation")
         axes[1].set_title("Phase Separation Progress")
@@ -1206,8 +1206,8 @@ def main():
         # Plot 3: Phase fractions vs time
         ph_high = np.array(sim.history['phase_high']) * 100
         ph_low = np.array(sim.history['phase_low']) * 100
-        axes[2].plot(times_h, ph_high, 'g-', linewidth=2, label='Li-rich (x>0.5)')
-        axes[2].plot(times_h, ph_low, 'orange', linewidth=2, label='Li-poor (x<0.5)')
+        axes[2].plot(times_h, ph_high, color='green', linestyle='-', linewidth=2, label='Li-rich (x>0.5)')
+        axes[2].plot(times_h, ph_low, color='orange', linestyle='-', linewidth=2, label='Li-poor (x<0.5)')
         axes[2].set_xlabel("Time (hours)")
         axes[2].set_ylabel("Phase fraction (%)")
         axes[2].set_title("Phase Evolution")
@@ -1221,7 +1221,8 @@ def main():
         # Optional: Free energy vs time
         with st.expander("🔋 Free Energy Evolution (click to expand)"):
             fig_fe, ax_fe = plt.subplots(figsize=(6, 4), dpi=100)
-            ax_fe.plot(times_h, sim.history['energy'], 'purple-', linewidth=2)
+            # ✅ FIXED: Use color= and linestyle= keywords instead of 'purple-'
+            ax_fe.plot(times_h, sim.history['energy'], color='purple', linestyle='-', linewidth=2)
             ax_fe.set_xlabel("Time (hours)")
             ax_fe.set_ylabel("Avg. free energy density (J/m³)")
             ax_fe.set_title("Free Energy Minimization")
