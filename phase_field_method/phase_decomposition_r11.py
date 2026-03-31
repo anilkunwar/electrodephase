@@ -368,17 +368,15 @@ class PhaseFieldSimulation:
         D_b : float - Diffusion coefficient in m²/s
         Omega_kJmol : float - Regular solution parameter in kJ/mol
         """
+        # =====================================================
+        # STEP 1: Define ALL state variables FIRST
+        # This fixes the AttributeError initialization order bug
+        # =====================================================
+        
         # Grid parameters (dimensionless internally for numerical stability)
         self.nx = nx
         self.ny = ny
         self.dx_dim = dx_dim
-        
-        # Initialize physical scales first
-        self.scales = PhysicalScalesLiFePO4(
-            L0_nm=L0_nm, 
-            D_b=D_b, 
-            Omega_kJmol=Omega_kJmol
-        )
         
         # Dimensionless model parameters (for numerical stability)
         self.W_dim = 1.0        # Double-well barrier (dimensionless)
@@ -386,22 +384,18 @@ class PhaseFieldSimulation:
         self.M_dim = 1.0        # Mobility (dimensionless)
         self.dt_dim = dt_dim    # Time step (dimensionless)
         
-        # ⚠️ CRITICAL: Define free energy coefficients BEFORE calling _update_physical_params
-        # This fixes the AttributeError from the original code
+        # Free energy coefficients (dimensionless)
         self.A_dim = self.W_dim
         self.B_dim = -2.0 * self.W_dim
         self.C_dim = self.W_dim
         
-        # Convert to physical parameters
-        self._update_physical_params()
-        
-        # Initialize concentration field
-        self.c = np.zeros((nx, ny), dtype=np.float64)
-        
-        # Time tracking (both dimensionless and physical)
+        # Time tracking (both dimensionless and physical) - DEFINED BEFORE _update_physical_params
         self.time_dim = 0.0
         self.time_phys = 0.0
         self.step = 0
+        
+        # Initialize concentration field
+        self.c = np.zeros((nx, ny), dtype=np.float64)
         
         # History for plotting and analysis
         self.history = {
@@ -414,10 +408,28 @@ class PhaseFieldSimulation:
             'energy': []
         }
         
+        # =====================================================
+        # STEP 2: Initialize physical scales
+        # =====================================================
+        self.scales = PhysicalScalesLiFePO4(
+            L0_nm=L0_nm, 
+            D_b=D_b, 
+            Omega_kJmol=Omega_kJmol
+        )
+        
+        # =====================================================
+        # STEP 3: NOW safe to call _update_physical_params()
+        # All required attributes are defined above
+        # =====================================================
+        self._update_physical_params()
+        
     def _update_physical_params(self):
         """
         Convert dimensionless parameters to physical SI units.
         Called whenever model or material parameters change.
+        
+        DEFENSIVE: Uses hasattr() checks to prevent AttributeError
+        even if called before all attributes are initialized.
         """
         # Defensive: ensure free energy coefficients exist
         if not hasattr(self, 'A_dim'):
@@ -426,6 +438,15 @@ class PhaseFieldSimulation:
             self.B_dim = -2.0 * getattr(self, 'W_dim', 1.0)
         if not hasattr(self, 'C_dim'):
             self.C_dim = getattr(self, 'W_dim', 1.0)
+        
+        # Defensive: ensure time_dim exists (fixes the main bug)
+        if not hasattr(self, 'time_dim'):
+            self.time_dim = 0.0
+        
+        # Defensive: ensure scales exists
+        if not hasattr(self, 'scales'):
+            # Create default scales if not initialized
+            self.scales = PhysicalScalesLiFePO4()
         
         # Convert main parameters
         (self.W_phys, self.kappa_phys, self.M_phys, 
