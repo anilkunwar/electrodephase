@@ -22,6 +22,9 @@
 
 [![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition10-streamlit-red)](https://electrode-phasedecomposition10.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based simulation, advanced form of S4, coupling with electric field, BV and MHC electrochemical kinetics, C-rate information as input)
 
+[![continuummodelphasedecomposition2d](https://img.shields.io/badge/phasedecomposition11-streamlit-red)](https://electrode-phasedecomposition11.streamlit.app/)  (with basics of phase decomposition simulation - specific FePO4 <--> LiFePO4 phase decomposition,  preliminary and double well based simulation, no other external fields)
+
+
 
 # physics informed neural network
 
